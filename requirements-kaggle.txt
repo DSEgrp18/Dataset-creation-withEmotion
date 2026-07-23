@@ -1,0 +1,40 @@
+# Dependencies for build_emotional_sinhala_dataset.py
+#
+# NOTE: On Kaggle, torch / torchaudio / numpy / scipy come preinstalled with a
+# CUDA build -- do NOT reinstall them (you will break the GPU wheels). Everything
+# below is additive. The `download` stage needs ONLY `internetarchive`.
+#
+# Install on Kaggle:  pip install -r requirements-kaggle.txt
+# (see kaggle_pilot.ipynb for the exact, ordered install cell)
+
+# --- stage 1: download (the only hard dependency; pure Python, no GPU) ------
+internetarchive>=3.5,<5
+
+# --- audio IO / DSP (stages 2-9) -------------------------------------------
+librosa>=0.10
+soundfile>=0.12
+pyloudnorm>=0.1.1
+
+# --- stage 2: source separation --------------------------------------------
+demucs>=4.0
+
+# --- stage 3: diarization (gated -> needs HF token + accepted terms) --------
+pyannote.audio>=3.1
+
+# --- stage 5/6: ASR + alignment --------------------------------------------
+faster-whisper>=1.0
+# whisperx is optional: it has NO Sinhala align model, so 'auto'/'whisper'
+# alignment (Whisper word probabilities) is used for 'si'. Install only if you
+# also process a WhisperX-supported language.
+# whisperx>=3.1
+transformers>=4.40
+
+# --- stage 8: emotion ------------------------------------------------------
+# audEERING dimensional model (default) uses transformers (above) only.
+# emotion2vec (categorical, optional) needs FunASR + modelscope:
+# funasr>=1.1
+# modelscope>=1.15
+
+# --- optional quality metrics / denoise ------------------------------------
+# speechmos>=1.1        # DNSMOS (stage 7). If absent, dnsmos=None and its filter is skipped.
+# deepfilternet>=0.5    # --denoise (stage 2)

@@ -1,0 +1,31 @@
+# Pipeline outputs are manifest-first: do NOT commit audio or working data.
+work/
+/kaggle/
+eesd/
+
+# Audio / media (never redistribute source recordings)
+*.mp3
+*.ogg
+*.wav
+*.flac
+*.m4a
+
+# But DO keep the shareable manifests/reports if you place them at repo root:
+!download_manifest.csv
+!manifest.csv
+!needs_manual_transcription.csv
+!report.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
