@@ -99,6 +99,16 @@ DEFAULT_MAX_CLIP_FRAC = 0.01  # fraction of samples at full scale
 # A clip that fails ASR but is emotionally salient is worth manual transcription.
 MANUAL_AROUSAL = 0.60         # arousal >= this (0..1) => keep for manual review
 
+# The speaker-diarization-3.1 pipeline pulls weights from SEVERAL gated repos
+# (the pipeline config, the segmentation model, and -- in newer pyannote builds --
+# the x-vector/PLDA embedding from community-1). Every one must be accepted with
+# the SAME HuggingFace account, or diarization falls back to SPEAKER_UNK.
+PYANNOTE_GATED_REPOS = [
+    "pyannote/speaker-diarization-3.1",
+    "pyannote/segmentation-3.0",
+    "pyannote/speaker-diarization-community-1",
+]
+
 REPORT_NOTES = [
     "Manifest-first: this report describes clips by identifier + timestamps. "
     "Source audio is NOT redistributed; regenerate it locally from archive.org.",
@@ -388,6 +398,16 @@ def _dnsmos(y, sr):
         return float(res.get("ovrl_mos") or res.get("ovrl") or 0.0)
     except Exception:
         return None
+
+
+def _audio_duration(path) -> float:
+    """Duration in seconds, read from the header (no full decode)."""
+    try:
+        import soundfile as sf
+        info = sf.info(str(path))
+        return float(info.frames) / float(info.samplerate)
+    except Exception:
+        return 0.0
 
 
 def _parse_length(val) -> float:
@@ -681,14 +701,15 @@ def stage_diarize(cfg: Config) -> None:
             if pipeline is None:
                 # pyannote returns None (instead of raising) when the gated terms
                 # have not been accepted for the pipeline or its dependencies.
-                raise RuntimeError(
-                    "from_pretrained returned None -- accept the gated terms for "
-                    "BOTH pyannote/speaker-diarization-3.1 and "
-                    "pyannote/segmentation-3.0 with the same HF account")
+                raise RuntimeError("from_pretrained returned None (gated access)")
             pipeline.to(torch.device(resolve_device(cfg)))
             log("diarize", "loaded pyannote/speaker-diarization-3.1")
         except Exception as e:
             warn("diarize", f"could not load pyannote ({e}); using SPEAKER_UNK")
+            warn("diarize", "accept the gated terms for ALL of these, with the "
+                            "SAME HF account that issued your token:")
+            for repo in PYANNOTE_GATED_REPOS:
+                warn("diarize", f"    https://huggingface.co/{repo}")
             pipeline = None
 
     for meta in _iter_items_with_stage(cfg, "separate"):
@@ -712,8 +733,12 @@ def stage_diarize(cfg: Config) -> None:
                 except Exception as e:
                     warn("diarize", f"  diarization failed ({e}); SPEAKER_UNK")
             if not turns:
-                dur = sf.get("length_sec") or 0.0
-                turns = [{"start": 0.0, "end": float(dur), "speaker": "SPEAKER_UNK"}]
+                # One turn spanning the ACTUAL separated audio -- not the full
+                # source length. Using length_sec here made --smoke (which keeps
+                # only the first few minutes) report a diarize duration longer
+                # than the audio that exists, corrupting the yield funnel.
+                dur = _audio_duration(vpath) or float(sf.get("length_sec") or 0.0)
+                turns = [{"start": 0.0, "end": dur, "speaker": "SPEAKER_UNK"}]
             sf["diarization"] = turns
             log("diarize", f"  {ident}: {len(turns)} turn(s)")
         mark_done(meta, "diarize")
