@@ -162,6 +162,7 @@ class Config:
     hf_token_env: str
     asr_model: str
     emotion_model: str        # "audeering" | "emotion2vec"
+    diarization_model: str    # "auto" | explicit HF pipeline id
     denoise: bool
     aligner: str              # "auto" | "whisperx" | "whisper"
     max_minutes: float | None
@@ -218,6 +219,7 @@ def build_config(args: argparse.Namespace) -> Config:
         hf_token_env=args.hf_token_env,
         asr_model=asr_model,
         emotion_model=args.emotion_model,
+        diarization_model=args.diarization_model,
         denoise=args.denoise,
         aligner=args.aligner,
         max_minutes=args.max_minutes,
@@ -686,31 +688,46 @@ def stage_diarize(cfg: Config) -> None:
              "no HF token (env or Kaggle secret) -> cannot load gated "
              "pyannote/speaker-diarization-3.1. Marking every clip SPEAKER_UNK "
              "and continuing (segmentation will not be speaker-pure).")
+    # 'auto' walks the candidates until one loads: 3.1 first (it is what the
+    # pipeline was designed around), then community-1, which newer pyannote
+    # builds use and which is self-contained rather than pulling 3.1's deps.
+    candidates = ([cfg.diarization_model] if cfg.diarization_model != "auto"
+                  else ["pyannote/speaker-diarization-3.1",
+                        "pyannote/speaker-diarization-community-1"])
     pipeline = None
     if token:
         try:
             from pyannote.audio import Pipeline
             import torch
-            model_id = "pyannote/speaker-diarization-3.1"
-            # pyannote.audio renamed the auth kwarg (use_auth_token -> token).
-            # Try the modern name first, fall back to the legacy one.
-            try:
-                pipeline = Pipeline.from_pretrained(model_id, token=token)
-            except TypeError:
-                pipeline = Pipeline.from_pretrained(model_id, use_auth_token=token)
-            if pipeline is None:
-                # pyannote returns None (instead of raising) when the gated terms
-                # have not been accepted for the pipeline or its dependencies.
-                raise RuntimeError("from_pretrained returned None (gated access)")
-            pipeline.to(torch.device(resolve_device(cfg)))
-            log("diarize", "loaded pyannote/speaker-diarization-3.1")
         except Exception as e:
-            warn("diarize", f"could not load pyannote ({e}); using SPEAKER_UNK")
+            warn("diarize", f"pyannote.audio not importable ({e}); using SPEAKER_UNK")
+            Pipeline = None
+        if Pipeline is not None:
+            for model_id in candidates:
+                try:
+                    # pyannote renamed the auth kwarg (use_auth_token -> token);
+                    # try the modern name first, fall back to the legacy one.
+                    try:
+                        pipeline = Pipeline.from_pretrained(model_id, token=token)
+                    except TypeError:
+                        pipeline = Pipeline.from_pretrained(model_id, use_auth_token=token)
+                    if pipeline is None:
+                        # pyannote returns None rather than raising when the gated
+                        # terms have not been accepted.
+                        raise RuntimeError("from_pretrained returned None (gated access)")
+                    pipeline.to(torch.device(resolve_device(cfg)))
+                    log("diarize", f"loaded {model_id}")
+                    break
+                except Exception as e:
+                    warn("diarize", f"{model_id} failed: {e}")
+                    pipeline = None
+        if pipeline is None:
+            warn("diarize", "no diarization pipeline loaded -> using SPEAKER_UNK "
+                            "(clips will NOT be speaker-pure)")
             warn("diarize", "accept the gated terms for ALL of these, with the "
                             "SAME HF account that issued your token:")
             for repo in PYANNOTE_GATED_REPOS:
                 warn("diarize", f"    https://huggingface.co/{repo}")
-            pipeline = None
 
     for meta in _iter_items_with_stage(cfg, "separate"):
         ident = meta["ia_identifier"]
@@ -1305,6 +1322,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    choices=["audeering", "emotion2vec"],
                    help="audeering=dimensional arousal/valence (default); "
                         "emotion2vec=categorical")
+    p.add_argument("--diarization-model", default="auto",
+                   help="'auto' tries speaker-diarization-3.1 then "
+                        "speaker-diarization-community-1; or pass an explicit "
+                        "HF pipeline id")
     p.add_argument("--denoise", action="store_true",
                    help="apply DeepFilterNet denoise after Demucs")
     p.add_argument("--aligner", default="auto", choices=["auto", "whisperx", "whisper"],
