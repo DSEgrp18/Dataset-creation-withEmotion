@@ -744,7 +744,22 @@ def stage_diarize(cfg: Config) -> None:
                 log("diarize", f"  {ident}: diarizing {Path(vpath).name}")
                 try:
                     diar = pipeline(vpath)
-                    for turn, _, spk in diar.itertracks(yield_label=True):
+                    # pyannote >= 4 returns a DiarizeOutput wrapper rather than a
+                    # bare Annotation, so itertracks() may live on an attribute.
+                    ann = diar
+                    if not hasattr(ann, "itertracks"):
+                        for attr in ("speaker_diarization", "diarization",
+                                     "annotation", "output"):
+                            cand = getattr(diar, attr, None)
+                            if hasattr(cand, "itertracks"):
+                                ann = cand
+                                break
+                    if not hasattr(ann, "itertracks"):
+                        public = [a for a in dir(diar) if not a.startswith("_")]
+                        raise RuntimeError(
+                            f"no Annotation inside {type(diar).__name__}; "
+                            f"attributes seen: {public[:12]}")
+                    for turn, _, spk in ann.itertracks(yield_label=True):
                         turns.append({"start": float(turn.start),
                                       "end": float(turn.end), "speaker": str(spk)})
                 except Exception as e:
@@ -766,13 +781,6 @@ def stage_diarize(cfg: Config) -> None:
 # ========================================================================== #
 # STAGE 4 : segment (Silero VAD within speaker turns -> 2-12 s clips)
 # ========================================================================== #
-
-def _speaker_at(turns, t):
-    for tn in turns:
-        if tn["start"] <= t < tn["end"]:
-            return tn["speaker"]
-    return turns[0]["speaker"] if turns else "SPEAKER_UNK"
-
 
 def _split_long(start, end, max_dur):
     """Split [start,end] into <=max_dur chunks (even split)."""
@@ -817,25 +825,37 @@ def stage_segment(cfg: Config) -> None:
             for sp in speech:
                 s0 = sp["start"] / MODEL_SR
                 s1 = sp["end"] / MODEL_SR
-                for (a, b) in _split_long(s0, s1, MAX_DUR):
-                    if b - a < MIN_DUR:
+                # Intersect each VAD region with the speaker turns so that no
+                # utterance straddles a speaker change. Sampling the speaker at
+                # the segment midpoint (the previous approach) let a single clip
+                # contain two voices, which is useless as a TTS reference. With
+                # the SPEAKER_UNK fallback (one turn spanning the file) this
+                # reduces exactly to the old behaviour.
+                for tn in turns:
+                    a0 = max(s0, tn["start"])
+                    b0 = min(s1, tn["end"])
+                    if b0 - a0 < MIN_DUR:
                         continue
-                    spk = _speaker_at(turns, (a + b) / 2.0)
-                    clip_id = f"{ident}__{Path(sf['name']).stem}__seg{idx:04d}"
-                    segments.append({
-                        "clip_id": clip_id, "source_file": sf["name"],
-                        "vocals_path": vpath, "start_sec": round(a, 3),
-                        "end_sec": round(b, 3), "duration": round(b - a, 3),
-                        "speaker_id": spk,
-                        "text": "", "asr_conf": None, "align_conf": None,
-                        "snr": None, "dnsmos": None,
-                        "arousal": None, "valence": None, "emotion_label": None,
-                        "audio_ok": None, "align_ok": None,
-                        "reject_reason": "", "needs_manual": False,
-                        "clip_path": None,
-                    })
-                    idx += 1
-                    vad_minutes += (b - a) / 60.0
+                    for (a, b) in _split_long(a0, b0, MAX_DUR):
+                        if b - a < MIN_DUR:
+                            continue
+                        spk = tn["speaker"]
+                        clip_id = f"{ident}__{Path(sf['name']).stem}__seg{idx:04d}"
+                        segments.append({
+                            "clip_id": clip_id, "source_file": sf["name"],
+                            "vocals_path": vpath, "start_sec": round(a, 3),
+                            "end_sec": round(b, 3), "duration": round(b - a, 3),
+                            "speaker_id": spk,
+                            "text": "", "asr_conf": None, "align_conf": None,
+                            "snr": None, "dnsmos": None,
+                            "arousal": None, "valence": None,
+                            "emotion_label": None,
+                            "audio_ok": None, "align_ok": None,
+                            "reject_reason": "", "needs_manual": False,
+                            "clip_path": None,
+                        })
+                        idx += 1
+                        vad_minutes += (b - a) / 60.0
         meta["segments"] = segments
         mark_done(meta, "segment")
         save_meta(cfg, meta)
