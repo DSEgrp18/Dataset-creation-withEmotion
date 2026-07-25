@@ -671,8 +671,20 @@ def stage_diarize(cfg: Config) -> None:
         try:
             from pyannote.audio import Pipeline
             import torch
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1", use_auth_token=token)
+            model_id = "pyannote/speaker-diarization-3.1"
+            # pyannote.audio renamed the auth kwarg (use_auth_token -> token).
+            # Try the modern name first, fall back to the legacy one.
+            try:
+                pipeline = Pipeline.from_pretrained(model_id, token=token)
+            except TypeError:
+                pipeline = Pipeline.from_pretrained(model_id, use_auth_token=token)
+            if pipeline is None:
+                # pyannote returns None (instead of raising) when the gated terms
+                # have not been accepted for the pipeline or its dependencies.
+                raise RuntimeError(
+                    "from_pretrained returned None -- accept the gated terms for "
+                    "BOTH pyannote/speaker-diarization-3.1 and "
+                    "pyannote/segmentation-3.0 with the same HF account")
             pipeline.to(torch.device(resolve_device(cfg)))
             log("diarize", "loaded pyannote/speaker-diarization-3.1")
         except Exception as e:
@@ -1002,6 +1014,13 @@ def _load_audeering(device):
             return self.out_proj(x)
 
     class EmotionModel(Wav2Vec2PreTrainedModel):
+        # transformers >= ~4.57 reads `all_tied_weights_keys` while finalizing
+        # from_pretrained(). audEERING's published snippet predates that, so the
+        # attribute is missing and loading crashes with an AttributeError. This
+        # model ties no weights, so an empty mapping is the correct value -- and
+        # declaring it keeps the class working on old and new transformers alike.
+        all_tied_weights_keys: dict = {}
+
         def __init__(self, config):
             super().__init__(config)
             self.config = config
