@@ -16,6 +16,9 @@ eesd/
 !needs_manual_transcription.csv
 !report.json
 
+# Secrets -- never commit an API key
+api_key.txt
+
 # Python
 __pycache__/
 *.py[cod]
