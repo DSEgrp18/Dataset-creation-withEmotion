@@ -42,6 +42,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -54,21 +55,37 @@ import requests
 # CONFIG -- edit these
 # =========================================================================== #
 
-# Episodes to build. Verified live on archive.org.
+# "muwan-palassa" is not one episode -- it is the whole serial: 201 files,
+# Episode 001-201, 82 hours. The other identifiers are separate uploads of
+# individual episodes (several duplicate what is already in the collection).
 IDENTIFIERS = [
-    "muwan-palassa-140113",
-    "muwan-palassa-210113",
-    "MuwanPalassa29816",
-    "muwanpalassa_27513",
+    "muwan-palassa",
 ]
 
-# Optional: pull more episodes automatically instead of listing them by hand.
-# e.g. 'title:("Muwan Palassa")' -- leave "" to use IDENTIFIERS only.
+# Optional: pull more items automatically. e.g. 'title:("Muwan Palassa")'
+# finds 17 items. Leave "" to use IDENTIFIERS only.
 SEARCH_QUERY = ""
 SEARCH_MAX = 50
 
 OUT_ROOT = Path("/kaggle/working/dataset")
 RAW_ROOT = Path("/kaggle/working/raw")
+
+# ---- running the full 82 hours across several days ----------------------- #
+# 201 episodes x ~5 requests is ~1000 requests against a ~100/day allowance,
+# so the build spans roughly ten days. Two mechanisms carry it:
+#
+#   WITHIN a session : when every model is spent, sleep and retry. Free-tier
+#                      quota resets daily, and a Kaggle session lives ~12 h, so
+#                      one session can sit through a reset and carry on.
+#   ACROSS sessions  : /kaggle/working is wiped, so Save Version at the end and
+#                      add that output as a Data source next run. Anything found
+#                      under /kaggle/input is adopted before starting, and
+#                      finished episodes are skipped for free.
+WAIT_FOR_QUOTA = True      # False -> stop immediately when quota runs out
+QUOTA_POLL_MIN = 20.0      # minutes between retries while waiting
+SESSION_HOURS = 11.0       # stop before Kaggle kills the session (~12 h limit)
+DELETE_RAW_AFTER = True    # drop each mp3 once processed (saves ~600 MB)
+MAX_EPISODES = 0           # 0 = no cap; else stop after this many this run
 
 # Quota is per model, so a later one still works when an earlier is exhausted.
 MODELS = [
@@ -415,6 +432,91 @@ def call_gemini(y16_chunk, api_key, model, min_interval, last):
     raise RuntimeError("rate-limited after 8 attempts")
 
 
+def transcribe_chunk_waiting(seg, api_key, state):
+    """Transcribe one chunk, failing over between models and WAITING for quota.
+
+    Returns the parsed items, or None if the run should stop (session budget
+    spent, or waiting is disabled).
+
+    The daily allowance is per model, so exhausting one only retires that one.
+    When all are retired the function sleeps and clears the graveyard, because
+    a per-day cap does clear -- just not soon. Rather than predict Google's
+    reset moment (which the API never states), it simply retries every
+    QUOTA_POLL_MIN and lets a successful call be the proof that quota returned.
+    """
+    while True:
+        for model in MODELS:
+            if model in state["dead"]:
+                continue
+            try:
+                items = call_gemini(seg, api_key, model,
+                                    60.0 / RPM if RPM else 0.0, state["last"])
+                state["requests"] += 1
+                return items
+            except QuotaExhausted as ex:
+                warn("gemini", f"{ex}")
+                state["dead"].add(model)
+            except Exception as ex:
+                warn("gemini", f"  {type(ex).__name__}: {ex}")
+                return None
+
+        # Every model is spent.
+        if not WAIT_FOR_QUOTA:
+            state["stop"] = "quota"
+            return None
+        left = state["deadline"] - time.time()
+        if left < QUOTA_POLL_MIN * 60:
+            state["stop"] = "session"
+            warn("gemini", "quota spent and not enough session time left to "
+                           "wait it out -- stopping cleanly")
+            return None
+        state["waits"] += 1
+        resume = time.strftime("%H:%M:%S",
+                               time.localtime(time.time() + QUOTA_POLL_MIN * 60))
+        log("quota", f"all {len(MODELS)} models spent. Sleeping "
+                     f"{QUOTA_POLL_MIN:.0f} min (retry ~{resume}); "
+                     f"{left/3600:.1f} h of session left.")
+        time.sleep(QUOTA_POLL_MIN * 60)
+        state["dead"].clear()      # let the retry decide whether quota is back
+
+
+def adopt_previous_output():
+    """Seed /kaggle/working from a previous run attached under /kaggle/input.
+
+    Kaggle wipes /kaggle/working between sessions, so a multi-day build would
+    otherwise restart from zero every time. Attaching the last run's output as
+    a Data source and copying its caches in makes finished episodes free.
+    """
+    inp = Path("/kaggle/input")
+    if not inp.is_dir():
+        return 0
+    adopted = 0
+    for cand in inp.glob("*/dataset"):
+        if not cand.is_dir():
+            continue
+        for ep in cand.iterdir():
+            if not ep.is_dir():
+                continue
+            dst = OUT_ROOT / ep.name
+            if dst.exists():
+                continue
+            # Only the cheap-to-copy evidence of past work: the chunk cache
+            # (so no request is repeated) and the manifest (so the episode
+            # counts as done). Clips are regenerable and would be GBs.
+            src_chunks, src_man = ep / ".chunks", ep / "manifest.csv"
+            if src_man.exists() or src_chunks.is_dir():
+                dst.mkdir(parents=True, exist_ok=True)
+                if src_chunks.is_dir():
+                    shutil.copytree(src_chunks, dst / ".chunks",
+                                    dirs_exist_ok=True)
+                if src_man.exists():
+                    shutil.copy2(src_man, dst / "manifest.csv")
+                adopted += 1
+    if adopted:
+        log("resume", f"adopted {adopted} episode(s) from a previous run")
+    return adopted
+
+
 # =========================================================================== #
 # One episode
 # =========================================================================== #
@@ -447,27 +549,11 @@ def build_episode(src: Path, ident: str, api_key: str, state: dict) -> dict:
                 cf.unlink(missing_ok=True)
         if items is None:
             seg = y16[int(c0 * MODEL_SR):int(c1 * MODEL_SR)]
-            for model in MODELS:
-                if model in state["dead"]:
-                    continue
-                try:
-                    log("gemini", f"  chunk {i+1}/{len(chunks)} "
-                                  f"({c1-c0:.0f}s) via {model}")
-                    items = call_gemini(seg, api_key, model,
-                                        60.0 / RPM if RPM else 0.0, state["last"])
-                    state["requests"] += 1
-                    break
-                except QuotaExhausted as ex:
-                    warn("gemini", f"{ex}")
-                    state["dead"].add(model)
-                except Exception as ex:
-                    warn("gemini", f"  {type(ex).__name__}: {ex}")
-                    break
+            log("gemini", f"  chunk {i+1}/{len(chunks)} ({c1-c0:.0f}s)")
+            items = transcribe_chunk_waiting(seg, api_key, state)
             if items is None:
                 failed += 1
-                if len(state["dead"]) >= len(MODELS):
-                    state["out_of_quota"] = True
-                    warn("gemini", "all models out of daily quota")
+                if state["stop"]:
                     break
                 continue
             cf.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
@@ -545,6 +631,7 @@ def main():
     api_key = get_api_key()
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     RAW_ROOT.mkdir(parents=True, exist_ok=True)
+    adopt_previous_output()
 
     idents = list(IDENTIFIERS)
     if SEARCH_QUERY:
@@ -552,41 +639,74 @@ def main():
         found = ia_search(SEARCH_QUERY, SEARCH_MAX)
         log("search", f"matched {len(found)} item(s)")
         idents = list(dict.fromkeys(idents + found))
-    log("plan", f"{len(idents)} episode(s); ~{CHUNK_SEC/60:.0f} min per request")
 
-    state = {"dead": set(), "last": [0.0], "requests": 0, "out_of_quota": False}
-    summary, all_rows = [], []
-
-    for n, ident in enumerate(idents, 1):
-        if state["out_of_quota"]:
-            log("plan", f"stopping at episode {n}: daily quota spent")
-            break
-        log("episode", f"[{n}/{len(idents)}] {ident}")
+    # Flatten to (identifier, file) pairs. One archive.org ITEM can hold many
+    # episodes -- "muwan-palassa" holds all 201 -- so the unit of work is a
+    # FILE, not an item.
+    work: list[tuple[str, dict]] = []
+    for ident in idents:
         try:
             files, lic = ia_pick_audio(ident)
         except Exception as ex:
-            warn("episode", f"  metadata failed ({ex}); skipping")
-            continue
-        if not files:
-            warn("episode", "  no audio files; skipping")
+            warn("plan", f"{ident}: metadata failed ({ex}); skipping")
             continue
         if lic != "ABSENT":
-            log("episode", f"  license: {lic}")
-        for f in files:
-            try:
-                src = ia_download(ident, f["name"], RAW_ROOT / ident / f["name"])
-            except Exception as ex:
-                warn("episode", f"  download failed ({ex}); skipping")
-                continue
-            try:
-                res = build_episode(src, ident, api_key, state)
-            except Exception as ex:
-                warn("episode", f"  build failed ({type(ex).__name__}: {ex})")
-                continue
-            all_rows.extend(res.pop("rows", []))
-            summary.append(res)
-            if state["out_of_quota"]:
-                break
+            log("plan", f"{ident}: license {lic}")
+        for f in sorted(files, key=lambda x: x["name"]):
+            work.append((ident, f))
+
+    def already_done(ident, fname) -> bool:
+        stem = re.sub(r"\W+", "_", Path(fname).stem).strip("_")
+        return (OUT_ROOT / stem / "manifest.csv").exists()
+
+    todo = [(i, f) for i, f in work if not already_done(i, f["name"])]
+    skipped = len(work) - len(todo)
+    hours = sum(float(f.get("length", 0) or 0) for _, f in todo) / 3600
+    log("plan", f"{len(work)} episode(s) total; {skipped} already done; "
+                f"{len(todo)} to do (~{hours:.1f} h audio)")
+    est = sum(max(1, round(float(f.get('length', 0) or 0) / CHUNK_SEC))
+              for _, f in todo)
+    log("plan", f"~{est} API requests needed; free tier gives roughly "
+                f"{len(MODELS)*20}/day")
+    if MAX_EPISODES:
+        todo = todo[:MAX_EPISODES]
+        log("plan", f"capped to {len(todo)} episode(s) this run")
+
+    state = {"dead": set(), "last": [0.0], "requests": 0, "stop": "",
+             "waits": 0, "deadline": time.time() + SESSION_HOURS * 3600}
+    summary, all_rows = [], []
+
+    for n, (ident, f) in enumerate(todo, 1):
+        if state["stop"]:
+            break
+        if time.time() > state["deadline"]:
+            state["stop"] = "session"
+            log("plan", "session time budget reached; stopping cleanly")
+            break
+        log("episode", f"[{n}/{len(todo)}] {ident} :: {f['name']}")
+        try:
+            src = ia_download(ident, f["name"], RAW_ROOT / ident / f["name"])
+        except Exception as ex:
+            warn("episode", f"  download failed ({ex}); skipping")
+            continue
+        try:
+            res = build_episode(src, ident, api_key, state)
+        except Exception as ex:
+            warn("episode", f"  build failed ({type(ex).__name__}: {ex})")
+            continue
+        all_rows.extend(res.pop("rows", []))
+        summary.append(res)
+        if DELETE_RAW_AFTER:
+            src.unlink(missing_ok=True)
+
+    # Re-read every manifest so the combined CSV covers previous runs too, not
+    # just what this session happened to produce.
+    all_rows = []
+    for man in sorted(OUT_ROOT.glob("*/manifest.csv")):
+        try:
+            all_rows.extend(csv.DictReader(man.open(encoding="utf-8-sig")))
+        except Exception:
+            pass
 
     if all_rows:
         with (OUT_ROOT / "all_manifests.csv").open("w", newline="",
@@ -599,22 +719,32 @@ def main():
                     "models_exhausted": sorted(state["dead"])},
                    indent=2, ensure_ascii=False), encoding="utf-8")
 
-    done = sum(1 for s in summary if s["complete"])
-    print("\n" + "=" * 62)
-    print(f"  episodes attempted : {len(summary)}  ({done} complete)")
-    print(f"  clips              : {sum(s['clips'] for s in summary)}")
-    print(f"  audio              : {sum(s['minutes'] for s in summary):.1f} min")
-    print(f"  API requests used  : {state['requests']}")
+    total_eps = len(list(OUT_ROOT.glob("*/manifest.csv")))
+    total_min = sum(float(r["duration"]) for r in all_rows) / 60.0
+    print("\n" + "=" * 64)
+    print(f"  THIS RUN   episodes {len(summary)} | requests {state['requests']}"
+          f" | quota waits {state['waits']}")
+    print(f"  CUMULATIVE episodes {total_eps}/{len(work)} | clips "
+          f"{len(all_rows)} | audio {total_min/60:.1f} h")
     if state["dead"]:
-        print(f"  models exhausted   : {', '.join(sorted(state['dead']))}")
-    print(f"  output             : {OUT_ROOT}")
-    print("=" * 62)
-    if state["out_of_quota"]:
-        print("\n  Daily quota spent. Re-run TOMORROW -- finished chunks are")
-        print("  cached, so completed work costs nothing on the next run.")
-        print("  (Cache lives in /kaggle/working, which is wiped between")
-        print("   sessions -- Save Version now to keep it.)")
-    print("\n  Save Version to persist /kaggle/working before the session ends.")
+        print(f"  models spent : {', '.join(sorted(state['dead']))}")
+    print(f"  output       : {OUT_ROOT}")
+    print("=" * 64)
+
+    remaining = len(work) - total_eps
+    if remaining > 0:
+        print(f"\n  {remaining} episode(s) still to do.")
+        if state["stop"] == "session":
+            print("  Stopped on the session time budget, not on quota.")
+        elif state["stop"] == "quota":
+            print("  Stopped on quota (WAIT_FOR_QUOTA is off).")
+        print("\n  TO CONTINUE TOMORROW:")
+        print("   1. Save Version now (File -> Save Version -> Save & Run All)")
+        print("   2. Next run: Add Data -> Your Work -> this notebook's output")
+        print("   3. Run again. Finished episodes are adopted and skipped free.")
+    else:
+        print("\n  ALL EPISODES COMPLETE.")
+    print("\n  /kaggle/working is wiped between sessions -- Save Version to keep it.")
 
 
 if __name__ == "__main__":
