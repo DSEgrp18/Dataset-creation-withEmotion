@@ -64,6 +64,7 @@ MIN_CLIP = 1.0            # drop anything shorter; too little for a TTS referenc
 MAX_CLIP = 15.0           # drop anything longer; likely a merge failure
 PAD = 0.10                # seconds of breathing room each side
 SNAP_TOL = 1.0            # how far a proposed boundary may be from real speech
+HIFI_MIN_SR = 22_050      # at/above this the source keeps sibilant energy
 
 # The binding constraint is REQUESTS PER DAY, not audio minutes. The free tier
 # allows only ~20 generateContent calls per day PER MODEL (the API reports
@@ -654,8 +655,13 @@ def main(argv=None) -> int:
                   f"{dropped['long']} >{MAX_CLIP}s")
 
     # ---- export --------------------------------------------------------- #
-    y_hi = _resample(y_raw, sr_raw, TARGET_SR)
-    total = len(y_hi) / TARGET_SR
+    # Never upsample -- see kaggle_build_dataset.py. A 24 kHz header on 11 kHz
+    # content is a lie that costs double the disk.
+    out_sr = min(TARGET_SR, sr_raw)
+    quality = "hifi" if sr_raw >= HIFI_MIN_SR else "lofi"
+    y_hi = _resample(y_raw, sr_raw, out_sr)
+    total = len(y_hi) / out_sr
+    log("audio", f"source {sr_raw} Hz -> clips {out_sr} Hz [{quality}]")
     stem = src.stem.replace(" ", "_")
     rows, clip_b64 = [], {}
     prev_b = 0.0    # end of the previously EXPORTED clip, padding included
@@ -671,12 +677,12 @@ def main(argv=None) -> int:
         if b - a < MIN_CLIP:
             continue
         prev_b = b
-        clip = y_hi[int(a * TARGET_SR):int(b * TARGET_SR)]
+        clip = y_hi[int(a * out_sr):int(b * out_sr)]
         cid = f"{stem}__{n:04d}"
-        _save_wav(clips_dir / f"{cid}.wav", clip, TARGET_SR)
+        _save_wav(clips_dir / f"{cid}.wav", clip, out_sr)
         if not args.no_embed_audio:
             clip_b64[cid] = base64.b64encode(
-                _wav_bytes(_resample(clip, TARGET_SR, MODEL_SR), MODEL_SR)
+                _wav_bytes(_resample(clip, out_sr, MODEL_SR), MODEL_SR)
             ).decode("ascii")
         else:
             clip_b64[cid] = ""
@@ -690,6 +696,7 @@ def main(argv=None) -> int:
             "duration": round(b - a, 3),
             "text": s.text,
             "snapped": s.snapped,
+            "sample_rate": out_sr, "quality": quality,
         })
 
     man = out_dir / "manifest.csv"

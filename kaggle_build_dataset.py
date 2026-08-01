@@ -55,12 +55,34 @@ import requests
 # CONFIG -- edit these
 # =========================================================================== #
 
-# "muwan-palassa" is not one episode -- it is the whole serial: 201 files,
-# Episode 001-201, 82 hours. The other identifiers are separate uploads of
-# individual episodes (several duplicate what is already in the collection).
+# TWO QUALITY TIERS, and the order here matters -- hi-fi is built FIRST so the
+# valuable audio lands before quota or session time runs out.
+#
+#   hi-fi : 16 single-episode uploads, 44.1 kHz / 64-128 kbps, 6.8 h total.
+#           Real bandwidth; suitable for TTS voice quality.
+#   lo-fi : "muwan-palassa" -- the whole serial, 201 files, 82 h, but every one
+#           is 11025 Hz / 16 kbps. Nyquist caps it at 5.5 kHz, so fricatives and
+#           sibilants are largely gone. Useful for prosody and emotional range,
+#           marginal for final voice quality.
+#
+# Both are built and every clip is tagged (`quality`, `sample_rate`) so training
+# can filter. NOTE: some hi-fi uploads duplicate episodes inside the collection,
+# so filter to ONE tier before training or the same speech appears twice.
 IDENTIFIERS = [
+    # --- hi-fi first ---
+    "muwan-palassa-70113", "muwan-palassa-140113", "muwan-palassa-210113",
+    "muwan-palassa-280113", "muwan-palassa-040213", "muwan-palassa-110213",
+    "muwan-palassa-180213", "MuwanPalassa29816", "MuwanPalassa22816",
+    "MuwanPalassa12916", "MuwanPalassa19916", "MuwanPalassa101016",
+    "MuwanPalassa51216", "muwanpalassa_03613", "muwanpalassa_20513",
+    "muwanpalassa_27513",
+    # --- then the full lo-fi serial ---
     "muwan-palassa",
 ]
+
+# A clip is "hifi" at or above this source rate. 22050 Hz puts the ceiling at
+# 11 kHz, which covers the sibilant energy 11025 Hz audio loses.
+HIFI_MIN_SR = 22_050
 
 # Optional: pull more items automatically. e.g. 'title:("Muwan Palassa")'
 # finds 17 items. Leave "" to use IDENTIFIERS only.
@@ -584,8 +606,16 @@ def build_episode(src: Path, ident: str, api_key: str, state: dict) -> dict:
         seen.add(k)
         final.append(s)
 
-    y_hi = resample(y_raw, sr, TARGET_SR)
-    total = len(y_hi) / TARGET_SR
+    # NEVER upsample. Writing 24 kHz from an 11025 Hz source doubles the file
+    # size while adding exactly no information, and makes the header claim a
+    # bandwidth the audio does not have. Clips keep the source rate when it is
+    # below TARGET_SR, and `sample_rate` records the truth for the loader.
+    out_sr = min(TARGET_SR, sr)
+    quality = "hifi" if sr >= HIFI_MIN_SR else "lofi"
+    y_out = resample(y_raw, sr, out_sr)
+    total = len(y_out) / out_sr
+    log("audio", f"  source {sr} Hz -> clips {out_sr} Hz [{quality}]")
+
     rows, prev_b = [], 0.0
     for n, s in enumerate(final):
         nxt = final[n + 1].start_sec if n + 1 < len(final) else total
@@ -597,12 +627,13 @@ def build_episode(src: Path, ident: str, api_key: str, state: dict) -> dict:
         cid = f"{stem}__{n:04d}"
         if KEEP_CLIPS:
             save_wav(out_dir / "clips" / f"{cid}.wav",
-                     y_hi[int(a * TARGET_SR):int(b * TARGET_SR)], TARGET_SR)
+                     y_out[int(a * out_sr):int(b * out_sr)], out_sr)
         rows.append({"clip_id": cid, "identifier": ident,
                      "source_file": src.name,
                      "start_sec": round(a, 3), "end_sec": round(b, 3),
                      "duration": round(b - a, 3),
-                     "text": s.text, "snapped": s.snapped})
+                     "text": s.text, "snapped": s.snapped,
+                     "sample_rate": out_sr, "quality": quality})
 
     if rows:
         with (out_dir / "manifest.csv").open("w", newline="",
@@ -721,11 +752,18 @@ def main():
 
     total_eps = len(list(OUT_ROOT.glob("*/manifest.csv")))
     total_min = sum(float(r["duration"]) for r in all_rows) / 60.0
+    hifi = [r for r in all_rows if r.get("quality") == "hifi"]
+    lofi = [r for r in all_rows if r.get("quality") == "lofi"]
     print("\n" + "=" * 64)
     print(f"  THIS RUN   episodes {len(summary)} | requests {state['requests']}"
           f" | quota waits {state['waits']}")
     print(f"  CUMULATIVE episodes {total_eps}/{len(work)} | clips "
           f"{len(all_rows)} | audio {total_min/60:.1f} h")
+    if hifi or lofi:
+        hh = sum(float(r["duration"]) for r in hifi) / 3600
+        lh = sum(float(r["duration"]) for r in lofi) / 3600
+        print(f"  BY QUALITY hifi {len(hifi)} clips / {hh:.2f} h"
+              f"  |  lofi {len(lofi)} clips / {lh:.2f} h")
     if state["dead"]:
         print(f"  models spent : {', '.join(sorted(state['dead']))}")
     print(f"  output       : {OUT_ROOT}")
