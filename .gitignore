@@ -19,6 +19,13 @@ eesd/
 # Secrets -- never commit an API key
 api_key.txt
 
+# Generated dataset: the CLIPS are copyrighted source audio and must never be
+# redistributed. manifest.csv (timestamps + text) is the shareable artifact and
+# is deliberately still committable.
+dataset/**/clips/
+dataset/**/.chunks/
+dataset/**/review.html
+
 # Python
 __pycache__/
 *.py[cod]

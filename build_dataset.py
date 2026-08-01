@@ -37,7 +37,11 @@ USAGE
     python build_dataset.py --duration-sec 0     # the whole episode
     python build_dataset.py --audio path/to.mp3 --out dataset
 
-Needs the same free Gemini key as the bench (api_key.txt or --api-key).
+Needs a free Gemini key in api_key.txt next to this script (or --api-key).
+Get one at https://aistudio.google.com/apikey -- no credit card.
+
+For many episodes at once, use kaggle_build_dataset.py instead: it adds
+archive.org downloading and runs where the network is fast.
 """
 
 from __future__ import annotations
@@ -53,18 +57,28 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-# Reuse the bench's audio/key plumbing rather than duplicating it.
-from sinhala_stt_bench import (
-    MODEL_SR, _load_audio, _resample, _save_wav, _wav_bytes,
-    find_default_audio, load_source_cached, log, resolve_api_key, warn,
-)
+MODEL_SR = 16_000         # what the VAD and the API see
 
 TARGET_SR = 24_000        # TTS-ready output rate
 MIN_CLIP = 1.0            # drop anything shorter; too little for a TTS reference
 MAX_CLIP = 15.0           # drop anything longer; likely a merge failure
 PAD = 0.10                # seconds of breathing room each side
-CHUNK_TARGET = 60.0       # seconds of audio per Gemini request
 SNAP_TOL = 1.0            # how far a proposed boundary may be from real speech
+
+# The binding constraint is REQUESTS PER DAY, not audio minutes. The free tier
+# allows only ~20 generateContent calls per day PER MODEL (the API reports
+# `GenerateRequestsPerDayPerProjectPerModel-FreeTier, limit: 20`). Widely-quoted
+# "1500 requests/day" figures do not apply to this model.
+#
+# So chunks are big: at 300 s a 25-minute episode costs 6 requests instead of 25.
+# Audio is sent as FLAC, which roughly halves the payload and keeps a 5-minute
+# chunk well inside the ~20 MB inline-data ceiling.
+CHUNK_TARGET = 300.0
+
+# Quota is per model, so exhausting one does not exhaust the next. Tried in
+# order; a model that reports its daily limit is retired for the rest of the run.
+DEFAULT_MODELS = ("gemini-3.6-flash,gemini-3.5-flash,gemini-flash-latest,"
+                  "gemini-3-flash-preview,gemini-2.5-flash")
 
 GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/"
               "models/{model}:generateContent")
@@ -100,6 +114,96 @@ RESPONSE_SCHEMA = {
         "required": ["start_sec", "end_sec", "text"],
     },
 }
+
+
+def log(stage: str, msg: str) -> None:
+    print(f"[{stage}] {msg}", flush=True)
+
+
+def warn(stage: str, msg: str) -> None:
+    print(f"[{stage}] WARNING: {msg}", file=sys.stderr, flush=True)
+
+
+def resolve_api_key(cli_key: str = "") -> str:
+    """Find the Gemini key. Order: --api-key, api_key.txt, environment."""
+    import os
+    if cli_key:
+        return cli_key.strip()
+    keyfile = Path(__file__).with_name("api_key.txt")
+    if keyfile.exists():
+        txt = keyfile.read_text(encoding="utf-8").strip()
+        if txt:
+            return txt
+    return (os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY") or "").strip()
+
+
+def find_default_audio() -> Path | None:
+    """Locate the downloaded episode so the script runs with no arguments."""
+    root = Path(__file__).with_name("work") / "raw"
+    if not root.is_dir():
+        return None
+    for ext in ("*.mp3", "*.ogg", "*.flac", "*.wav", "*.m4a"):
+        found = sorted(root.rglob(ext))
+        if found:
+            return found[0]
+    return None
+
+
+def _load_audio(path, sr=None, mono=True, duration=None, offset=0.0):
+    import librosa
+    y, out_sr = librosa.load(str(path), sr=sr, mono=mono,
+                             duration=duration, offset=offset)
+    return y.astype("float32"), out_sr
+
+
+def _resample(y, orig_sr, target_sr):
+    if orig_sr == target_sr:
+        return y
+    import librosa
+    return librosa.resample(y, orig_sr=orig_sr, target_sr=target_sr)
+
+
+def _wav_bytes(y, sr) -> bytes:
+    """In-memory PCM16 wav, for embedding players in the review page."""
+    import io
+    import numpy as np
+    import soundfile as sf
+    buf = io.BytesIO()
+    y = np.clip(np.asarray(y, dtype="float32"), -1.0, 1.0)
+    sf.write(buf, y, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def _save_wav(path: Path, y, sr) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_wav_bytes(y, sr))
+
+
+def load_source_cached(src: Path, cache_dir: Path, offset: float,
+                       duration: float | None):
+    """Decode the source once and cache it as wav; reuse it on later runs.
+
+    mp3 decode runs well below realtime on a cold start, and this script is
+    meant to be re-run while adjusting chunking, so the cost is paid once.
+    Cached at the SOURCE sample rate so clip export stays full quality.
+    """
+    key = f"{src.stem}__off{offset:g}__dur{duration if duration else 'all'}.wav"
+    cached = cache_dir / key
+    if cached.exists():
+        log("audio", f"cache hit: {cached.name}")
+        return _load_audio(cached, sr=None, mono=True)
+    log("audio", f"decoding {src.name} (cache miss)")
+    t0 = time.time()
+    y, sr = _load_audio(src, sr=None, mono=True, duration=duration, offset=offset)
+    log("audio", f"decoded {len(y)/sr:.1f}s @ {sr} Hz in {time.time()-t0:.1f}s")
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    _save_wav(cached, y, sr)
+    return y, sr
+
+
+class QuotaExhausted(RuntimeError):
+    """A model's per-DAY free-tier allowance is gone; waiting will not help."""
 
 
 @dataclass
@@ -176,14 +280,25 @@ def snap_chunk(raw: list[tuple[float, float, str]], regions, c0: float, c1: floa
     """
     inside = [r for r in regions if r[1] > c0 and r[0] < c1]
     owner: dict[int, list[tuple[float, float]]] = {i: [] for i in range(len(raw))}
+    # Assignment is MONOTONIC: regions are walked in time order and the sentence
+    # pointer never moves backwards. Over a 5-minute chunk the model's absolute
+    # timestamps drift by seconds, and without this a drifted sentence can claim
+    # a region from far away, interleaving two speakers. Speech and sentences
+    # are both strictly ordered in time, so order is the reliable signal even
+    # when the numbers are not.
+    cur = 0
     for r in inside:
         best_i, best_ov = None, 0.0
-        for i, (s, e, _) in enumerate(raw):
+        for i in range(cur, len(raw)):
+            s, e, _ = raw[i]
+            if s > r[1]:                # sentences are sorted; no later one fits
+                break
             ov = min(r[1], e) - max(r[0], s)
             if ov > best_ov:
                 best_ov, best_i = ov, i
         if best_i is not None:          # no overlap with any sentence -> drop
             owner[best_i].append(r)
+            cur = best_i
 
     out: list[Sentence] = []
     for i, (s, e, text) in enumerate(raw):
@@ -248,16 +363,36 @@ def enforce_no_overlap(sents: list[Sentence]) -> int:
 # Gemini
 # --------------------------------------------------------------------------- #
 
+def _flac_bytes(y, sr) -> bytes:
+    """FLAC-encode a chunk. Lossless, ~half the size of WAV, accepted by Gemini.
+
+    Matters because the payload ceiling is what caps chunk length, and chunk
+    length is what determines how many of the day's ~20 requests an episode
+    costs.
+    """
+    import io
+    import numpy as np
+    import soundfile as sf
+    buf = io.BytesIO()
+    y = np.clip(np.asarray(y, dtype="float32"), -1.0, 1.0)
+    sf.write(buf, y, sr, format="FLAC", subtype="PCM_16")
+    return buf.getvalue()
+
+
 def transcribe_chunk(y16_chunk, api_key: str, model: str,
                      min_interval: float, last: list) -> list[dict]:
-    """One chunk -> list of {start_sec, end_sec, text} (times relative to chunk)."""
+    """One chunk -> list of {start_sec, end_sec, text} (times relative to chunk).
+
+    Raises QuotaExhausted if `model` has spent its daily allowance, so the
+    caller can move to the next model rather than burning retries.
+    """
     import requests
     body = {
         "contents": [{"parts": [
             {"text": PROMPT},
-            {"inline_data": {"mime_type": "audio/wav",
+            {"inline_data": {"mime_type": "audio/flac",
                              "data": base64.b64encode(
-                                 _wav_bytes(y16_chunk, MODEL_SR)).decode("ascii")}},
+                                 _flac_bytes(y16_chunk, MODEL_SR)).decode("ascii")}},
         ]}],
         "generationConfig": {
             "temperature": 0.0,
@@ -303,9 +438,18 @@ def transcribe_chunk(y16_chunk, api_key: str, model: str,
             wait = 0.0
             try:
                 for d in r.json().get("error", {}).get("details", []):
+                    for v in d.get("violations", []):
+                        # A PER-DAY violation will not clear by waiting, so stop
+                        # retrying this model and let the caller switch.
+                        if "PerDay" in str(v.get("quotaId", "")):
+                            raise QuotaExhausted(
+                                f"{model}: daily free-tier limit "
+                                f"({v.get('quotaValue')}) reached")
                     rd = d.get("retryDelay")
                     if rd:
                         wait = float(str(rd).rstrip("s"))
+            except QuotaExhausted:
+                raise
             except Exception:
                 pass
             wait = max(wait, 15.0 * (attempt + 1))
@@ -374,7 +518,9 @@ def main(argv=None) -> int:
     ap.add_argument("--audio", help="source audio; default: auto-detect under work/raw/")
     ap.add_argument("--out", default="dataset")
     ap.add_argument("--api-key", default="")
-    ap.add_argument("--model", default="gemini-2.5-flash")
+    ap.add_argument("--models", default=DEFAULT_MODELS,
+                    help="comma list tried in order; quota is per model, so a "
+                         "later one still works when an earlier is exhausted")
     ap.add_argument("--offset-sec", type=float, default=60.0)
     ap.add_argument("--duration-sec", type=float, default=300.0,
                     help="0 = the whole episode")
@@ -404,7 +550,7 @@ def main(argv=None) -> int:
     clips_dir.mkdir(parents=True, exist_ok=True)
 
     log("dataset", f"source: {src.name}")
-    y_raw, sr_raw = load_source_cached(src, Path("work/bench/cache"),
+    y_raw, sr_raw = load_source_cached(src, out_dir / ".cache",
                                        args.offset_sec, duration)
     y16 = _resample(y_raw, sr_raw, MODEL_SR)
     log("dataset", f"{len(y_raw)/sr_raw:.1f}s @ {sr_raw} Hz")
@@ -427,6 +573,9 @@ def main(argv=None) -> int:
     cache_dir = out_dir / ".chunks"
     cache_dir.mkdir(parents=True, exist_ok=True)
     failed: list[int] = []
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    dead: set[str] = set()
+    log("gemini", f"models (in order): {', '.join(models)}")
 
     for i, (c0, c1) in enumerate(chunks):
         cache_f = cache_dir / f"chunk_{i:04d}_{c0:.1f}-{c1:.1f}.json"
@@ -445,11 +594,28 @@ def main(argv=None) -> int:
         seg = y16[int(c0 * MODEL_SR):int(c1 * MODEL_SR)]
         log("gemini", f"chunk {i+1}/{len(chunks)}  {c0:.1f}-{c1:.1f}s "
                       f"({c1-c0:.1f}s)")
-        try:
-            items = transcribe_chunk(seg, api_key, args.model, min_interval, last)
-        except Exception as ex:
-            warn("gemini", f"chunk {i+1} failed ({type(ex).__name__}: {ex}); "
-                           f"re-run to retry just this chunk")
+        items = None
+        for model in models:
+            if model in dead:
+                continue
+            try:
+                items = transcribe_chunk(seg, api_key, model, min_interval, last)
+                if model != models[0]:
+                    log("gemini", f"  (via {model})")
+                break
+            except QuotaExhausted as ex:
+                warn("gemini", f"{ex}; switching model")
+                dead.add(model)
+            except Exception as ex:
+                warn("gemini", f"chunk {i+1} on {model} failed "
+                               f"({type(ex).__name__}: {ex})")
+                break
+        if items is None:
+            if len(dead) >= len(models):
+                warn("gemini", "every model is out of daily quota -- stopping. "
+                               "Re-run tomorrow; finished chunks are cached.")
+                failed.extend(range(i, len(chunks)))
+                break
             failed.append(i)
             continue
         cache_f.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
