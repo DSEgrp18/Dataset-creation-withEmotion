@@ -92,20 +92,21 @@ SEARCH_MAX = 50
 OUT_ROOT = Path("/kaggle/working/dataset")
 RAW_ROOT = Path("/kaggle/working/raw")
 
-# ---- running the full 82 hours across several days ----------------------- #
-# 201 episodes x ~5 requests is ~1000 requests against a ~100/day allowance,
-# so the build spans roughly ten days. Two mechanisms carry it:
+# ---- running the full corpus across several days ------------------------- #
+# ~217 episodes x ~5 requests is ~1090 requests against a ~100/day allowance,
+# so the build spans roughly a fortnight of short runs. Resuming is what carries
+# it: /kaggle/working is wiped between sessions, so Save Version at the end and
+# attach that output as a Data source next run. Anything found under
+# /kaggle/input is adopted before starting and skipped for free.
 #
-#   WITHIN a session : when every model is spent, sleep and retry. Free-tier
-#                      quota resets daily, and a Kaggle session lives ~12 h, so
-#                      one session can sit through a reset and carry on.
-#   ACROSS sessions  : /kaggle/working is wiped, so Save Version at the end and
-#                      add that output as a Data source next run. Anything found
-#                      under /kaggle/input is adopted before starting, and
-#                      finished episodes are skipped for free.
-WAIT_FOR_QUOTA = True      # False -> stop immediately when quota runs out
-QUOTA_POLL_MIN = 20.0      # minutes between retries while waiting
-SESSION_HOURS = 11.0       # stop before Kaggle kills the session (~12 h limit)
+# STOP as soon as every model reports its daily cap, write the output, and let
+# the run finish. Waiting was tried and measured: the full ~100-request daily
+# allowance is spent in about 90 minutes, and the free-tier cap resets at a
+# fixed time rather than trickling back, so retrying just burns session hours
+# for nothing. One short commit run per day is the real cadence.
+WAIT_FOR_QUOTA = False
+QUOTA_POLL_MIN = 20.0      # only used if WAIT_FOR_QUOTA is turned back on
+SESSION_HOURS = 11.0       # hard stop before Kaggle kills the session (~12 h)
 DELETE_RAW_AFTER = True    # drop each mp3 once processed (saves ~600 MB)
 MAX_EPISODES = 0           # 0 = no cap; else stop after this many this run
 
@@ -124,7 +125,18 @@ KEEP_CLIPS = True     # False -> manifest only (smaller output, still shareable)
 
 MODEL_SR = 16_000     # what the VAD and the API see
 TARGET_SR = 24_000    # what the clips are written at (TTS-ready)
-MIN_CLIP, MAX_CLIP = 1.0, 15.0
+
+# Target clip length. Raising the floor to 3 s would THROW AWAY roughly a third
+# of sentences (measured median 4.3 s, minimum 1.1 s), so short neighbours are
+# merged up to MAX_CLIP instead of discarded -- text is joined too.
+MIN_CLIP, MAX_CLIP = 3.0, 30.0
+
+# Two sentences are only merged if the silence between them is under this.
+# CAUTION: nothing here diarizes speakers, so merging across a short pause in
+# dialogue can put TWO VOICES in one clip, which is poor as a TTS reference.
+# Lower this toward 0.3 for safer (but shorter) clips; raise it for longer ones.
+MERGE_GAP = 0.6
+
 PAD = 0.10
 SNAP_TOL = 1.0
 
@@ -378,6 +390,34 @@ def snap_chunk(raw, regions, c0, c1) -> list[Sentence]:
     return out
 
 
+def merge_short(sents: list[Sentence]) -> list[Sentence]:
+    """Join adjacent short sentences so clips land in the MIN_CLIP..MAX_CLIP band.
+
+    Simply dropping everything under MIN_CLIP would discard about a third of the
+    corpus, and the discarded part is the emotionally dense part -- exclamations,
+    interjections, one-word replies are exactly the short ones. Merging keeps
+    them, with the texts concatenated in order.
+
+    Guards: only merges across a gap under MERGE_GAP, and never past MAX_CLIP.
+    A merged clip is `snapped` only if every part was, so an unverified
+    timestamp taints the whole clip rather than hiding inside it.
+    """
+    out: list[Sentence] = []
+    for s in sents:
+        if out:
+            prev = out[-1]
+            gap = s.start_sec - prev.end_sec
+            too_short = prev.duration < MIN_CLIP or s.duration < MIN_CLIP
+            fits = (s.end_sec - prev.start_sec) <= MAX_CLIP
+            if too_short and fits and 0 <= gap <= MERGE_GAP:
+                prev.end_sec = s.end_sec
+                prev.text = (prev.text + " " + s.text).strip()
+                prev.snapped = prev.snapped and s.snapped
+                continue
+        out.append(Sentence(s.start_sec, s.end_sec, s.text, s.snapped))
+    return out
+
+
 def enforce_no_overlap(sents) -> int:
     sents.sort(key=lambda x: (x.start_sec, x.end_sec))
     n = 0
@@ -502,6 +542,28 @@ def transcribe_chunk_waiting(seg, api_key, state):
         state["dead"].clear()      # let the retry decide whether quota is back
 
 
+def write_aggregate() -> list[dict]:
+    """Rebuild dataset/all_manifests.csv from every per-episode manifest.
+
+    Reads from disk rather than from memory so the combined file covers
+    PREVIOUS runs adopted from /kaggle/input too, not just this session.
+    Returns the rows so callers can report on them.
+    """
+    rows: list[dict] = []
+    for man in sorted(OUT_ROOT.glob("*/manifest.csv")):
+        try:
+            rows.extend(csv.DictReader(man.open(encoding="utf-8-sig")))
+        except Exception:
+            pass
+    if rows:
+        with (OUT_ROOT / "all_manifests.csv").open(
+                "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+    return rows
+
+
 def adopt_previous_output():
     """Seed /kaggle/working from a previous run attached under /kaggle/input.
 
@@ -598,13 +660,18 @@ def build_episode(src: Path, ident: str, api_key: str, state: dict) -> dict:
                 "failed_chunks": failed, "complete": failed == 0}
 
     enforce_no_overlap(sents)
-    final, seen = [], set()
+    uniq, seen = [], set()
     for s in sents:
         k = (round(s.start_sec, 2), round(s.end_sec, 2))
-        if k in seen or not (MIN_CLIP <= s.duration <= MAX_CLIP):
+        if k in seen:
             continue
         seen.add(k)
-        final.append(s)
+        uniq.append(s)
+    merged = merge_short(uniq)
+    final = [s for s in merged if MIN_CLIP <= s.duration <= MAX_CLIP]
+    log("filter", f"  {len(uniq)} sentences -> {len(merged)} after merge -> "
+                  f"{len(final)} in {MIN_CLIP:.0f}-{MAX_CLIP:.0f}s "
+                  f"({len(merged)-len(final)} outside the band)")
 
     # NEVER upsample. Writing 24 kHz from an 11025 Hz source doubles the file
     # size while adding exactly no information, and makes the header claim a
@@ -729,22 +796,12 @@ def main():
         summary.append(res)
         if DELETE_RAW_AFTER:
             src.unlink(missing_ok=True)
+        # Rewrite the aggregate after EVERY episode. Writing it only at the end
+        # meant an interrupted run left no combined manifest at all, even though
+        # every per-episode file was already on disk.
+        write_aggregate()
 
-    # Re-read every manifest so the combined CSV covers previous runs too, not
-    # just what this session happened to produce.
-    all_rows = []
-    for man in sorted(OUT_ROOT.glob("*/manifest.csv")):
-        try:
-            all_rows.extend(csv.DictReader(man.open(encoding="utf-8-sig")))
-        except Exception:
-            pass
-
-    if all_rows:
-        with (OUT_ROOT / "all_manifests.csv").open("w", newline="",
-                                                   encoding="utf-8-sig") as fh:
-            w = csv.DictWriter(fh, fieldnames=list(all_rows[0].keys()))
-            w.writeheader()
-            w.writerows(all_rows)
+    all_rows = write_aggregate()
     (OUT_ROOT / "summary.json").write_text(
         json.dumps({"episodes": summary, "requests_used": state["requests"],
                     "models_exhausted": sorted(state["dead"])},

@@ -60,8 +60,11 @@ from pathlib import Path
 MODEL_SR = 16_000         # what the VAD and the API see
 
 TARGET_SR = 24_000        # TTS-ready output rate
-MIN_CLIP = 1.0            # drop anything shorter; too little for a TTS reference
-MAX_CLIP = 15.0           # drop anything longer; likely a merge failure
+# Target band. Raising the floor to 3 s alone would discard ~30% of
+# sentences, so short neighbours are MERGED up to MAX_CLIP instead.
+MIN_CLIP = 3.0
+MAX_CLIP = 30.0
+MERGE_GAP = 0.6           # max silence bridged when merging (see merge_short)
 PAD = 0.10                # seconds of breathing room each side
 SNAP_TOL = 1.0            # how far a proposed boundary may be from real speech
 HIFI_MIN_SR = 22_050      # at/above this the source keeps sibilant energy
@@ -341,6 +344,32 @@ def _absorb(items, c0: float, c1: float, regions,
     n_unsnapped = sum(1 for c in chunk_sents if not c.snapped)
     log("gemini", f"  -> {len(chunk_sents)} sentence(s)"
                   + (f" ({n_unsnapped} unsnapped)" if n_unsnapped else ""))
+
+
+def merge_short(sents: list[Sentence]) -> list[Sentence]:
+    """Join adjacent short sentences into the MIN_CLIP..MAX_CLIP band.
+
+    Dropping everything under MIN_CLIP would discard about a third of the
+    corpus, and the discarded third is the emotionally dense part -- one-word
+    replies and exclamations are precisely the short ones.
+
+    CAUTION: nothing here diarizes speakers, so bridging a short pause in
+    dialogue can put two voices in one clip. MERGE_GAP bounds that risk.
+    """
+    out: list[Sentence] = []
+    for s in sents:
+        if out:
+            prev = out[-1]
+            gap = s.start_sec - prev.end_sec
+            too_short = prev.duration < MIN_CLIP or s.duration < MIN_CLIP
+            fits = (s.end_sec - prev.start_sec) <= MAX_CLIP
+            if too_short and fits and 0 <= gap <= MERGE_GAP:
+                prev.end_sec = s.end_sec
+                prev.text = (prev.text + " " + s.text).strip()
+                prev.snapped = prev.snapped and s.snapped
+                continue
+        out.append(Sentence(s.start_sec, s.end_sec, s.text, s.snapped, s.chunk))
+    return out
 
 
 def enforce_no_overlap(sents: list[Sentence]) -> int:
@@ -633,26 +662,18 @@ def main(argv=None) -> int:
     # Drop duplicates created when two model sentences snap onto the same
     # region span, and enforce the length window.
     sents.sort(key=lambda x: (x.start_sec, x.end_sec))
-    final: list[Sentence] = []
+    uniq: list[Sentence] = []
     seen: set[tuple[float, float]] = set()
-    dropped = {"dupe": 0, "short": 0, "long": 0}
     for s in sents:
         key = (round(s.start_sec, 2), round(s.end_sec, 2))
         if key in seen:
-            dropped["dupe"] += 1
-            continue
-        if s.duration < MIN_CLIP:
-            dropped["short"] += 1
-            continue
-        if s.duration > MAX_CLIP:
-            dropped["long"] += 1
             continue
         seen.add(key)
-        final.append(s)
-
-    log("filter", f"kept {len(final)}; dropped "
-                  f"{dropped['dupe']} duplicate, {dropped['short']} <{MIN_CLIP}s, "
-                  f"{dropped['long']} >{MAX_CLIP}s")
+        uniq.append(s)
+    merged = merge_short(uniq)
+    final = [s for s in merged if MIN_CLIP <= s.duration <= MAX_CLIP]
+    log("filter", f"{len(uniq)} sentences -> {len(merged)} after merge -> "
+                  f"{len(final)} in {MIN_CLIP:.0f}-{MAX_CLIP:.0f}s")
 
     # ---- export --------------------------------------------------------- #
     # Never upsample -- see kaggle_build_dataset.py. A 24 kHz header on 11 kHz
