@@ -533,7 +533,7 @@ def call_gemini(y16_chunk, api_key, model, min_interval, last):
     raise RuntimeError("rate-limited after 8 attempts")
 
 
-def transcribe_chunk_waiting(seg, api_key, state):
+def transcribe_chunk_waiting(seg, state):
     """Transcribe one chunk, failing over between models and WAITING for quota.
 
     Returns the parsed items, or None if the run should stop (session budget
@@ -545,28 +545,43 @@ def transcribe_chunk_waiting(seg, api_key, state):
     reset moment (which the API never states), it simply retries every
     QUOTA_POLL_MIN and lets a successful call be the proof that quota returned.
     """
+    keys = state["keys"]
     while True:
-        for model in MODELS:
-            if model in state["dead"]:
+        # Walk every (key, model) pair. Quota is per project, so a second key
+        # is a second allowance -- and a 403 on one project does not touch the
+        # other. Keys are the outer loop so a healthy project is reached even
+        # when the first one is entirely blocked.
+        for ki, api_key in enumerate(keys):
+            if ki in state["dead_keys"]:
                 continue
-            try:
-                items = call_gemini(seg, api_key, model,
-                                    60.0 / RPM if RPM else 0.0, state["last"])
-                state["requests"] += 1
-                return items
-            except QuotaExhausted as ex:
-                warn("gemini", f"{ex}")
-                state["dead"].add(model)
-            except ProjectDenied:
-                # Affects the project, so every model fails the same way.
-                # Stop the entire run instead of failing 200 more episodes.
-                state["stop"] = "denied"
-                return None
-            except Exception as ex:
-                warn("gemini", f"  {type(ex).__name__}: {ex}")
-                return None
+            for model in MODELS:
+                if (ki, model) in state["dead"]:
+                    continue
+                try:
+                    items = call_gemini(seg, api_key, model,
+                                        60.0 / RPM if RPM else 0.0,
+                                        state["last"])
+                    state["requests"] += 1
+                    state["used_key"] = ki
+                    return items
+                except QuotaExhausted as ex:
+                    warn("gemini", f"key{ki+1}: {ex}")
+                    state["dead"].add((ki, model))
+                except ProjectDenied:
+                    # Blocks the whole project, so every model on this key
+                    # fails identically. Retire the key, try the next one.
+                    warn("gemini", f"key{ki+1}: project DENIED (403) -- "
+                                   f"retiring this key for the run")
+                    state["dead_keys"].add(ki)
+                    break
+                except Exception as ex:
+                    warn("gemini", f"  {type(ex).__name__}: {ex}")
+                    return None
 
-        # Every model is spent.
+        if len(state["dead_keys"]) >= len(keys):
+            state["stop"] = "denied"
+            return None
+        # Every key/model pair is spent.
         if not WAIT_FOR_QUOTA:
             state["stop"] = "quota"
             return None
@@ -691,7 +706,7 @@ def resolve_done(fname: str, length_sec: float) -> bool:
 # One episode
 # =========================================================================== #
 
-def build_episode(src: Path, ident: str, api_key: str, state: dict) -> dict:
+def build_episode(src: Path, ident: str, state: dict) -> dict:
     stem = re.sub(r"\W+", "_", src.stem).strip("_")
     out_dir = OUT_ROOT / stem
     cache_dir = out_dir / ".chunks"
@@ -720,7 +735,7 @@ def build_episode(src: Path, ident: str, api_key: str, state: dict) -> dict:
         if items is None:
             seg = y16[int(c0 * MODEL_SR):int(c1 * MODEL_SR)]
             log("gemini", f"  chunk {i+1}/{len(chunks)} ({c1-c0:.0f}s)")
-            items = transcribe_chunk_waiting(seg, api_key, state)
+            items = transcribe_chunk_waiting(seg, state)
             if items is None:
                 failed += 1
                 if state["stop"]:
@@ -825,7 +840,8 @@ def build_episode(src: Path, ident: str, api_key: str, state: dict) -> dict:
 
 def main():
     ensure_deps()
-    api_key = get_api_key()
+    keys = get_api_keys()
+    log("setup", f"{len(keys)} API key(s) available")
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     RAW_ROOT.mkdir(parents=True, exist_ok=True)
     adopt_previous_output()
@@ -866,8 +882,10 @@ def main():
         todo = todo[:MAX_EPISODES]
         log("plan", f"capped to {len(todo)} episode(s) this run")
 
-    state = {"dead": set(), "last": [0.0], "requests": 0, "stop": "",
-             "waits": 0, "deadline": time.time() + SESSION_HOURS * 3600}
+    state = {"dead": set(), "dead_keys": set(), "keys": keys,
+             "last": [0.0], "requests": 0, "stop": "", "waits": 0,
+             "used_key": 0,
+             "deadline": time.time() + SESSION_HOURS * 3600}
     summary, all_rows = [], []
 
     for n, (ident, f) in enumerate(todo, 1):
@@ -884,7 +902,7 @@ def main():
             warn("episode", f"  download failed ({ex}); skipping")
             continue
         try:
-            res = build_episode(src, ident, api_key, state)
+            res = build_episode(src, ident, state)
         except Exception as ex:
             warn("episode", f"  build failed ({type(ex).__name__}: {ex})")
             continue
