@@ -106,6 +106,17 @@ RAW_ROOT = Path("/kaggle/working/raw")
 # for nothing. One short commit run per day is the real cadence.
 WAIT_FOR_QUOTA = False
 QUOTA_POLL_MIN = 20.0      # only used if WAIT_FOR_QUOTA is turned back on
+
+# What to adopt from a previous run attached under /kaggle/input.
+#
+#   False -> take only the .chunks cache and REBUILD the manifest and clips with
+#            the settings in this file. Costs no API quota (every chunk is a
+#            cache hit) but re-downloads and re-cuts the audio. Use this after
+#            changing MIN_CLIP/MAX_CLIP/TARGET_SR, or the corpus ends up half
+#            built to old rules and half to new.
+#   True  -> take the manifests too and skip those episodes entirely. Fastest,
+#            correct only when the settings have not changed since.
+ADOPT_MANIFESTS = False
 SESSION_HOURS = 11.0       # hard stop before Kaggle kills the session (~12 h)
 DELETE_RAW_AFTER = True    # drop each mp3 once processed (saves ~600 MB)
 MAX_EPISODES = 0           # 0 = no cap; else stop after this many this run
@@ -593,11 +604,21 @@ def adopt_previous_output():
                 if src_chunks.is_dir():
                     shutil.copytree(src_chunks, dst / ".chunks",
                                     dirs_exist_ok=True)
-                if src_man.exists():
+                # Copying the manifest is what marks an episode "done". Skip it
+                # and the episode is rebuilt from its cached transcription under
+                # the CURRENT settings, spending no quota.
+                if ADOPT_MANIFESTS and src_man.exists():
                     shutil.copy2(src_man, dst / "manifest.csv")
+                    # Carry completion across too, but only for episodes that
+                    # actually finished. A previous run's partial episode must
+                    # stay incomplete so it gets picked up again.
+                    if (ep / ".done").exists():
+                        shutil.copy2(ep / ".done", dst / ".done")
                 adopted += 1
     if adopted:
-        log("resume", f"adopted {adopted} episode(s) from a previous run")
+        mode = "skipped" if ADOPT_MANIFESTS else "re-exported from cache"
+        log("resume", f"adopted {adopted} episode(s) from a previous run "
+                      f"({mode})")
     return adopted
 
 
@@ -709,6 +730,19 @@ def build_episode(src: Path, ident: str, api_key: str, state: dict) -> dict:
             w.writeheader()
             w.writerows(rows)
 
+    # A manifest alone does NOT mean the episode is finished. When quota runs
+    # out mid-episode the transcribed chunks still produce clips, and treating
+    # that partial manifest as "done" would skip the rest of the episode on
+    # every future run -- silently losing most of it. Completion is recorded
+    # separately, and only when every chunk actually came back.
+    done_marker = out_dir / ".done"
+    if failed == 0:
+        done_marker.write_text(f"{len(rows)} clips", encoding="utf-8")
+    else:
+        done_marker.unlink(missing_ok=True)
+        warn("episode", f"  INCOMPLETE ({failed} chunk(s) missing) -- will be "
+                        f"finished on a later run")
+
     mins = sum(r["duration"] for r in rows) / 60.0
     ov = sum(1 for x, y in zip(rows, rows[1:])
              if y["start_sec"] < x["end_sec"] - 1e-6)
@@ -754,8 +788,10 @@ def main():
             work.append((ident, f))
 
     def already_done(ident, fname) -> bool:
+        # The .done marker, not the manifest -- a quota-truncated episode has a
+        # manifest but is not finished.
         stem = re.sub(r"\W+", "_", Path(fname).stem).strip("_")
-        return (OUT_ROOT / stem / "manifest.csv").exists()
+        return (OUT_ROOT / stem / ".done").exists()
 
     todo = [(i, f) for i, f in work if not already_done(i, f["name"])]
     skipped = len(work) - len(todo)
@@ -807,15 +843,18 @@ def main():
                     "models_exhausted": sorted(state["dead"])},
                    indent=2, ensure_ascii=False), encoding="utf-8")
 
-    total_eps = len(list(OUT_ROOT.glob("*/manifest.csv")))
+    # Count FINISHED episodes, not merely started ones.
+    total_eps = len(list(OUT_ROOT.glob("*/.done")))
+    partial = len(list(OUT_ROOT.glob("*/manifest.csv"))) - total_eps
     total_min = sum(float(r["duration"]) for r in all_rows) / 60.0
     hifi = [r for r in all_rows if r.get("quality") == "hifi"]
     lofi = [r for r in all_rows if r.get("quality") == "lofi"]
     print("\n" + "=" * 64)
     print(f"  THIS RUN   episodes {len(summary)} | requests {state['requests']}"
           f" | quota waits {state['waits']}")
-    print(f"  CUMULATIVE episodes {total_eps}/{len(work)} | clips "
-          f"{len(all_rows)} | audio {total_min/60:.1f} h")
+    print(f"  CUMULATIVE episodes {total_eps}/{len(work)} complete"
+          + (f" (+{partial} partial, will resume)" if partial else "")
+          + f" | clips {len(all_rows)} | audio {total_min/60:.1f} h")
     if hifi or lofi:
         hh = sum(float(r["duration"]) for r in hifi) / 3600
         lh = sum(float(r["duration"]) for r in lofi) / 3600
