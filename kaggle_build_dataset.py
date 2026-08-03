@@ -107,16 +107,6 @@ RAW_ROOT = Path("/kaggle/working/raw")
 WAIT_FOR_QUOTA = False
 QUOTA_POLL_MIN = 20.0      # only used if WAIT_FOR_QUOTA is turned back on
 
-# What to adopt from a previous run attached under /kaggle/input.
-#
-#   False -> take only the .chunks cache and REBUILD the manifest and clips with
-#            the settings in this file. Costs no API quota (every chunk is a
-#            cache hit) but re-downloads and re-cuts the audio. Use this after
-#            changing MIN_CLIP/MAX_CLIP/TARGET_SR, or the corpus ends up half
-#            built to old rules and half to new.
-#   True  -> take the manifests too and skip those episodes entirely. Fastest,
-#            correct only when the settings have not changed since.
-ADOPT_MANIFESTS = False
 SESSION_HOURS = 11.0       # hard stop before Kaggle kills the session (~12 h)
 DELETE_RAW_AFTER = True    # drop each mp3 once processed (saves ~600 MB)
 MAX_EPISODES = 0           # 0 = no cap; else stop after this many this run
@@ -200,6 +190,15 @@ class QuotaExhausted(RuntimeError):
     """A model's per-DAY allowance is gone; waiting will not help."""
 
 
+class ProjectDenied(RuntimeError):
+    """HTTP 403 -- the whole Google Cloud project is blocked, not rate limited.
+
+    Google's automated system flags free-tier projects, often wrongly. Every
+    model fails identically and no amount of retrying or model-switching helps,
+    so the run must stop rather than download 200 more episodes to fail on.
+    """
+
+
 @dataclass
 class Sentence:
     start_sec: float
@@ -236,25 +235,52 @@ def ensure_deps():
         os.system(f"{sys.executable} -m pip install -q " + " ".join(need))
 
 
-def get_api_key() -> str:
-    """Kaggle Secrets first, then env, then a local file."""
+def get_api_keys() -> list[str]:
+    """Every key we can find, in priority order.
+
+    MULTIPLE KEYS ARE WORTH HAVING. Quota is per PROJECT, so a key from a second
+    project brings its own daily allowance -- and if one project gets hit by
+    Google's automated 403 block, the run continues on the other instead of
+    stopping dead.
+
+    Sources, all merged:
+      * Kaggle Secrets  GEMINI_API_KEY, GEMINI_API_KEY_2 .. _5
+      * env             GEMINI_API_KEY / GOOGLE_API_KEY
+      * api_key.txt     ONE KEY PER LINE (blank lines and #comments ignored)
+    """
+    keys: list[str] = []
+
+    def add(k):
+        k = (k or "").strip()
+        if k and not k.startswith("#") and k not in keys:
+            keys.append(k)
+
     try:
         from kaggle_secrets import UserSecretsClient
-        k = UserSecretsClient().get_secret("GEMINI_API_KEY")
-        if k:
-            return k.strip()
+        us = UserSecretsClient()
+        for name in ("GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3",
+                     "GEMINI_API_KEY_4", "GEMINI_API_KEY_5"):
+            try:
+                add(us.get_secret(name))
+            except Exception:
+                pass          # not every slot will exist; that is fine
     except Exception:
         pass
+
     for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        if os.environ.get(var):
-            return os.environ[var].strip()
+        add(os.environ.get(var))
+
     f = Path("api_key.txt")
     if f.exists():
-        return f.read_text(encoding="utf-8").strip()
-    raise SystemExit(
-        "No API key.\n"
-        "  Kaggle: Add-ons -> Secrets -> add GEMINI_API_KEY, then re-run.\n"
-        "  Free key (no card): https://aistudio.google.com/apikey")
+        for line in f.read_text(encoding="utf-8").splitlines():
+            add(line)
+
+    if not keys:
+        raise SystemExit(
+            "No API key.\n"
+            "  Kaggle: Add-ons -> Secrets -> add GEMINI_API_KEY, then re-run.\n"
+            "  Free key (no card): https://aistudio.google.com/apikey")
+    return keys
 
 
 # =========================================================================== #
@@ -501,6 +527,8 @@ def call_gemini(y16_chunk, api_key, model, min_interval, last):
             warn("gemini", f"HTTP {r.status_code}; waiting {wait:.0f}s")
             time.sleep(wait)
             continue
+        if r.status_code == 403:
+            raise ProjectDenied(r.text[:200])
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
     raise RuntimeError("rate-limited after 8 attempts")
 
@@ -529,6 +557,11 @@ def transcribe_chunk_waiting(seg, api_key, state):
             except QuotaExhausted as ex:
                 warn("gemini", f"{ex}")
                 state["dead"].add(model)
+            except ProjectDenied:
+                # Affects the project, so every model fails the same way.
+                # Stop the entire run instead of failing 200 more episodes.
+                state["stop"] = "denied"
+                return None
             except Exception as ex:
                 warn("gemini", f"  {type(ex).__name__}: {ex}")
                 return None
@@ -575,51 +608,83 @@ def write_aggregate() -> list[dict]:
     return rows
 
 
-def adopt_previous_output():
-    """Seed /kaggle/working from a previous run attached under /kaggle/input.
+def adopt_previous_output() -> int:
+    """Copy whatever a previous run left under /kaggle/input into working.
 
-    Kaggle wipes /kaggle/working between sessions, so a multi-day build would
-    otherwise restart from zero every time. Attaching the last run's output as
-    a Data source and copying its caches in makes finished episodes free.
+    Kaggle wipes /kaggle/working between sessions, so without this a multi-day
+    build restarts from zero. Everything cheap is taken verbatim -- the chunk
+    cache (so no request is ever repeated), the manifest, and the .done marker.
+    Clips are skipped: they are regenerable and would be gigabytes.
+
+    Nothing is decided here. Whether an adopted episode still needs work is
+    worked out later by resolve_done(), which can see how long the episode
+    actually is.
     """
     inp = Path("/kaggle/input")
     if not inp.is_dir():
         return 0
+
+    # Find episode folders by SEARCHING for their contents at any depth, rather
+    # than assuming a layout. Kaggle mounts a notebook's output, an uploaded
+    # dataset, and a zip-derived dataset at different depths, and a fixed glob
+    # silently finds nothing -- which looks identical to "no previous run" and
+    # quietly re-spends a whole day of quota.
+    eps: dict[str, Path] = {}
+    for marker in list(inp.rglob("manifest.csv")) + list(inp.rglob(".chunks")):
+        ep = marker.parent
+        if ep.is_dir() and ep.name not in eps:
+            eps[ep.name] = ep
+
     adopted = 0
-    for cand in inp.glob("*/dataset"):
-        if not cand.is_dir():
+    for name, ep in sorted(eps.items()):
+        dst = OUT_ROOT / name
+        if dst.exists():
             continue
-        for ep in cand.iterdir():
-            if not ep.is_dir():
-                continue
-            dst = OUT_ROOT / ep.name
-            if dst.exists():
-                continue
-            # Only the cheap-to-copy evidence of past work: the chunk cache
-            # (so no request is repeated) and the manifest (so the episode
-            # counts as done). Clips are regenerable and would be GBs.
-            src_chunks, src_man = ep / ".chunks", ep / "manifest.csv"
-            if src_man.exists() or src_chunks.is_dir():
-                dst.mkdir(parents=True, exist_ok=True)
-                if src_chunks.is_dir():
-                    shutil.copytree(src_chunks, dst / ".chunks",
-                                    dirs_exist_ok=True)
-                # Copying the manifest is what marks an episode "done". Skip it
-                # and the episode is rebuilt from its cached transcription under
-                # the CURRENT settings, spending no quota.
-                if ADOPT_MANIFESTS and src_man.exists():
-                    shutil.copy2(src_man, dst / "manifest.csv")
-                    # Carry completion across too, but only for episodes that
-                    # actually finished. A previous run's partial episode must
-                    # stay incomplete so it gets picked up again.
-                    if (ep / ".done").exists():
-                        shutil.copy2(ep / ".done", dst / ".done")
-                adopted += 1
+        src_chunks, src_man = ep / ".chunks", ep / "manifest.csv"
+        dst.mkdir(parents=True, exist_ok=True)
+        if src_chunks.is_dir():
+            shutil.copytree(src_chunks, dst / ".chunks", dirs_exist_ok=True)
+        if src_man.exists():
+            shutil.copy2(src_man, dst / "manifest.csv")
+        if (ep / ".done").exists():
+            shutil.copy2(ep / ".done", dst / ".done")
+        adopted += 1
     if adopted:
-        mode = "skipped" if ADOPT_MANIFESTS else "re-exported from cache"
-        log("resume", f"adopted {adopted} episode(s) from a previous run "
-                      f"({mode})")
+        log("resume", f"adopted {adopted} episode(s) from {inp}")
+    elif eps:
+        log("resume", f"{len(eps)} episode(s) already present; nothing to adopt")
     return adopted
+
+
+def resolve_done(fname: str, length_sec: float) -> bool:
+    """Is this episode already finished? Decided from what is on disk.
+
+    Three cases, no configuration required:
+
+      * a .done marker           -> finished (written by a completed run)
+      * a manifest but no marker -> came from a run predating the marker, OR was
+                                    cut off mid-episode by quota. Tell them apart
+                                    by counting cached chunks against how many
+                                    the episode's duration implies. A complete
+                                    episode has them all, so backfill .done and
+                                    skip it. A truncated one does not, so redo it
+                                    -- its cached chunks make that nearly free.
+      * neither                  -> not started.
+    """
+    stem = re.sub(r"\W+", "_", Path(fname).stem).strip("_")
+    d = OUT_ROOT / stem
+    if (d / ".done").exists():
+        return True
+    if not (d / "manifest.csv").exists():
+        return False
+    cached = len(list((d / ".chunks").glob("*.json"))) if (d / ".chunks").is_dir() else 0
+    expected = max(1, round(length_sec / CHUNK_SEC))
+    if cached >= expected:
+        d.joinpath(".done").write_text("adopted", encoding="utf-8")
+        return True
+    log("resume", f"  {stem}: only {cached}/{expected} chunks cached "
+                  f"-- finishing it")
+    return False
 
 
 # =========================================================================== #
@@ -787,13 +852,8 @@ def main():
         for f in sorted(files, key=lambda x: x["name"]):
             work.append((ident, f))
 
-    def already_done(ident, fname) -> bool:
-        # The .done marker, not the manifest -- a quota-truncated episode has a
-        # manifest but is not finished.
-        stem = re.sub(r"\W+", "_", Path(fname).stem).strip("_")
-        return (OUT_ROOT / stem / ".done").exists()
-
-    todo = [(i, f) for i, f in work if not already_done(i, f["name"])]
+    todo = [(i, f) for i, f in work
+            if not resolve_done(f["name"], float(f.get("length", 0) or 0))]
     skipped = len(work) - len(todo)
     hours = sum(float(f.get("length", 0) or 0) for _, f in todo) / 3600
     log("plan", f"{len(work)} episode(s) total; {skipped} already done; "
