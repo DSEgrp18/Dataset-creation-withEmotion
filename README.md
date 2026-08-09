@@ -217,12 +217,27 @@ Sixteen further single-episode uploads exist ([search
 
 ## Files
 
+**Dataset build** (this directory)
+
 | File | Purpose |
 |---|---|
-| [`build_dataset.py`](build_dataset.py) | Local builder — one episode |
-| [`kaggle_build_dataset.py`](kaggle_build_dataset.py) | Kaggle builder — downloads + many episodes |
 | [`kaggle_build.ipynb`](kaggle_build.ipynb) | Kaggle notebook — pre-flight checks + Run All |
-| `api_key.txt` | Gemini key (git-ignored) |
+| [`kaggle_build_dataset.py`](kaggle_build_dataset.py) | Kaggle builder — archive.org downloads + many episodes |
+| [`build_dataset.py`](build_dataset.py) | Local builder — one episode |
+| [`check_quota.py`](check_quota.py) | when the Gemini quota resets, and which keys/models are live |
+| `api_key.txt` | Gemini key(s), one per line (git-ignored) |
+
+**Model training** — [`xtts_baseline/`](xtts_baseline/)
+
+| File | Purpose |
+|---|---|
+| [`xtts_baseline/kaggle_xtts_train.ipynb`](xtts_baseline/kaggle_xtts_train.ipynb) | fine-tune XTTS-v2 on the clips (needs a **GPU**) |
+| [`xtts_baseline/prepare_for_xtts.py`](xtts_baseline/prepare_for_xtts.py) | filters the manifest into XTTS's input format |
+
+The two halves are independent: the builder produces `manifest.csv` + `clips/`,
+and anything downstream consumes them. Training code itself lives in
+[DSEgrp18/XTTS_V2_Baseline](https://github.com/DSEgrp18/XTTS_V2_Baseline) and is
+cloned by the notebook — only the dataset-specific filter lives here.
 
 An engine-comparison bench (`sinhala_stt_bench.py`) produced the Gemini-vs-open-weight
 evidence above and was removed once the question was settled. Recover it with
