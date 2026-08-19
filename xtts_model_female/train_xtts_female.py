@@ -55,6 +55,15 @@ import os
 import sys
 from pathlib import Path
 
+# The coqui Trainer refuses to start when more than one GPU is visible:
+#   RuntimeError: [!] 2 active GPUs. Define the target GPU by CUDA_VISIBLE_DEVICES.
+# So Kaggle's "GPU T4 x2" fails outright unless we pin. Real multi-GPU needs
+# `python -m trainer.distribute` plus optimizer_wd_only_on_weights=False; that
+# roughly doubles throughput but adds a whole failure surface, so get a baseline
+# on one GPU first. setdefault means an explicit CUDA_VISIBLE_DEVICES still wins.
+# This must run before torch is imported, hence module level rather than main().
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
 _HERE = Path(__file__).resolve().parent
 for _cand in (_HERE, _HERE.parent / "xtts_sinhala"):
     if (_cand / "sinhala_text.py").is_file():

@@ -47,10 +47,14 @@ import argparse
 import base64
 import html
 import json
+import os
 import random
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+# Pin to one GPU, matching train_xtts_female.py.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 _HERE = Path(__file__).resolve().parent
 for _cand in (_HERE, _HERE.parent / "xtts_sinhala"):

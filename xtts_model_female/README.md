@@ -66,14 +66,24 @@ discovers rather than assumes, and prints every decision:
 
 - **speaker directories** matched by name substring, recursively, shallowest first
 - **`metadata.csv`** found by `rglob` under each speaker directory
-- **delimiter** scored across `,` `|` tab `;` and chosen by column-count consistency
+- **delimiter** scored across `|` tab `;` `,` by whether the split actually *separates*
+  script from romanisation, and only then by column-count consistency
 - **column order** found by content — the Sinhala column by codepoint range, the
   romanised column by its diacritics — never by index
 - **header row** detected and skipped, or absent; either works
+- **missing romanised column** falls back to transliterating the script
 
-Verified end to end against a synthetic fixture reproducing all of the above, including
-the nested directory, a header row in one speaker file and not the other, and rows that
-must be dropped.
+The last two bullets are not hypothetical. The delimiter scoring originally used
+consistency alone and **failed on the real corpus**: these files are pipe-delimited, but
+splitting a pipe-delimited line on commas also yields a consistent column count whenever
+each sentence contains one comma, which put Sinhala on both sides of the split. And
+**Harini's file has no romanised column at all** — only Sinhala script — so
+`sinhala_to_ascii()` transliterates it instead. Both paths verify at 0 `[UNK]`; which one
+each speaker took is printed and recorded in `prepare_report.json` under `text_source`.
+
+Verified end to end against synthetic fixtures reproducing all of the above, including the
+nested directory, the comma pattern that broke the delimiter scoring, a script-only
+metadata file, and rows that must be dropped.
 
 ### Rows that are dropped, and why
 
@@ -118,6 +128,26 @@ immediately if fp16 destabilises; pass `--no-mixed-precision` then.
 One thing that *looks* like a deviation but is not: the scheduler milestones are
 `[900000, 2700000, 5400000]` and `Trainer` defaults to `scheduler_after_epoch=True`, so
 those are **epochs** and the learning rate never decays. That is upstream behaviour.
+
+---
+
+## GPU pinning
+
+All three scripts set `CUDA_VISIBLE_DEVICES=0` at import, before torch loads. Without it
+the coqui Trainer refuses to start on any two-GPU accelerator:
+
+```
+RuntimeError: [!] 2 active GPUs. Define the target GPU by `CUDA_VISIBLE_DEVICES`.
+For multi-gpu training use `python -m trainer.distribute`.
+```
+
+Kaggle's "GPU T4 x2" therefore failed outright before this was pinned. `setdefault` is
+used, so an explicit `CUDA_VISIBLE_DEVICES` in the environment still wins.
+
+Real multi-GPU would roughly double throughput and is worth trying *after* a single-GPU
+baseline succeeds: it needs `python -m trainer.distribute --script train_xtts_female.py …`,
+`optimizer_wd_only_on_weights=False`, and `CUDA_VISIBLE_DEVICES` left unset. Every failed
+attempt costs a whole Kaggle session, which is why it is not the default.
 
 ---
 

@@ -52,12 +52,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import statistics as st
 import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+
+# Pin to one GPU, matching train_xtts_female.py, so synthesis is deterministic
+# and the two-GPU Kaggle accelerators behave the same as the single-GPU ones.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 HOP = 256
 N_MFCC = 13
