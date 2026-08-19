@@ -4,8 +4,9 @@
 train_xtts_female.py -- fine-tune XTTS-v2 on the two VoiceMakers female voices.
 
 The official Coqui recipe (recipes/ljspeech/xtts_v2/train_gpt_xtts.py and
-TTS/demos/xtts_ft_demo/utils/gpt_train.py) with four deviations, all deliberate
-and all listed here.
+TTS/demos/xtts_ft_demo/utils/gpt_train.py) with three deviations from upstream, all
+deliberate and all listed here, plus one setting that matches upstream and is
+listed anyway because it is the thing most likely to be changed back.
 
   language="en"      Selects a tokenizer branch, not a claim about the audio.
                      VoiceBpeTokenizer.preprocess_text raises NotImplementedError
@@ -24,8 +25,11 @@ and all listed here.
                      four times over shrinks the per-step signal, so this doubles
                      the rate. Drop to 5e-6 if loss_mel_ce gets noisy or rises.
 
-  mixed_precision    Off upstream, on here: roughly 2x throughput on a T4. The
-                     smoke run shows nan immediately if fp16 destabilises.
+  mixed_precision    Off, as upstream. fp16 roughly doubles throughput on a T4
+                     but drives loss_mel_ce to nan on the first step of this
+                     model and never recovers, and Turing has no bf16 -- so
+                     there is no stable mixed-precision option on that card.
+                     --mixed-precision opts in on a GPU where you have checked.
 
 MULTI-SPEAKER, AND WHY IT MATTERS HERE
 --------------------------------------
