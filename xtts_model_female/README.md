@@ -166,6 +166,14 @@ heartbeat and aborts if the loss has been `nan` for three consecutive reports.
 That guard exists because a real run burned an entire session at `nan` before it was
 added — the exit code was 0 the whole way.
 
+The parsing lives in [`train_log.py`](train_log.py), not in the notebook, because it has
+now failed in both directions: once by missing a `nan` run, and once by aborting a
+perfectly healthy one. The trainer prints its epoch averages in colour, so the raw bytes
+read `avg_loss_mel_ce:[92m 3.66`, and a naive regex captures `[92m` as the
+value — which is not a number, which looks exactly like divergence. `train_log.py` strips
+ANSI first and carries a selftest built from both real logs; run `python train_log.py`
+after touching it.
+
 ---
 
 ## Evaluation
