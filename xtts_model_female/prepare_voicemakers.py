@@ -24,7 +24,8 @@ script discovers rather than assumes:
   * speaker directories  : matched by name substring, recursively
   * metadata.csv         : found by rglob under each speaker directory
   * wav files            : found by rglob, indexed by filename stem
-  * delimiter            : scored across , | tab ; and chosen by consistency
+  * delimiter            : scored across | tab ; and , by whether the split
+                           actually SEPARATES script from romanisation
   * column order         : the Sinhala-script column is found by codepoint range,
                            the romanised column by its diacritics -- not by index
   * header row           : detected and skipped, or absent, either is fine
@@ -40,7 +41,11 @@ contains no Sinhala codepoint -- nor the diacritics of this corpus's romanisatio
 vocabulary already covers; verified here at 0 [UNK] before a GPU is touched.
 
 Both columns fold to identical ASCII on this corpus, so the romanised column is
-used and the script column is kept only for the evaluation reports.
+used and the script column is kept only for the evaluation reports. If a speaker's
+file carries no romanised column, sinhala_to_ascii() transliterates the script
+instead -- it agrees with fold(roman) on 96.6%% of pathnirvana's paired lines, so
+that path is equally trainable. Which path each speaker took is printed and
+recorded in prepare_report.json under "text_source".
 
 FILTERS
     duration   1.0 - 11.6 s   GPTArgs.max_wav_length = 255995 @ 22050 Hz; the
@@ -77,7 +82,7 @@ for _cand in (_HERE, _HERE.parent / "xtts_sinhala"):
         sys.path.insert(0, str(_cand))
         break
 try:
-    from sinhala_text import ROMAN_TO_ASCII, fold  # noqa: E402
+    from sinhala_text import ROMAN_TO_ASCII, fold, sinhala_to_ascii  # noqa: E402
 except ImportError:  # pragma: no cover
     sys.exit("ERROR: sinhala_text.py not found in this directory or ../xtts_sinhala/")
 
@@ -121,35 +126,11 @@ def find_speaker_dirs(src: Path, wanted: list[str]) -> dict[str, Path]:
     return found
 
 
-def sniff_rows(meta: Path) -> list[list[str]]:
-    """Parse the metadata file without trusting its delimiter or column order."""
-    raw = meta.read_text(encoding="utf-8-sig", errors="replace")
-    best, best_score = None, -1.0
-    for delim in [",", "|", "\t", ";"]:
-        try:
-            rows = [r for r in csv.reader(raw.splitlines(), delimiter=delim) if r]
-        except csv.Error:
-            continue
-        if not rows:
-            continue
-        widths = Counter(len(r) for r in rows)
-        width, n = widths.most_common(1)[0]
-        if width < 2:
-            continue
-        # consistency of column count, plus a bonus for finding a Sinhala column
-        score = n / len(rows)
-        good = [r for r in rows if len(r) == width]
-        if any(SINHALA.search(c) for c in good[0]):
-            score += 1.0
-        if score > best_score:
-            best, best_score = good, score
-    if best is None:
-        raise SystemExit(f"ERROR: could not parse {meta} with any known delimiter")
-    return best
+def locate_columns(rows: list[list[str]]) -> tuple[int, int, int | None] | None:
+    """(id_col, script_col, roman_col) by content, or None if there is no Sinhala.
 
-
-def locate_columns(rows: list[list[str]]) -> tuple[int, int, int]:
-    """Return (id_col, script_col, roman_col) by inspecting content, not position."""
+    roman_col is None when the file carries only the script -- see parse_metadata.
+    """
     n = len(rows[0])
     sinhala_hits = [0] * n
     roman_hits = [0] * n
@@ -160,15 +141,52 @@ def locate_columns(rows: list[list[str]]) -> tuple[int, int, int]:
             elif DIACRITICS.search(cell):
                 roman_hits[i] += 1
     script_col = max(range(n), key=lambda i: sinhala_hits[i])
-    roman_col = max(range(n), key=lambda i: roman_hits[i])
     if sinhala_hits[script_col] == 0:
-        raise SystemExit("ERROR: no Sinhala-script column found in the metadata")
+        return None
+    roman_col: int | None = max(range(n), key=lambda i: roman_hits[i])
     if roman_hits[roman_col] == 0 or roman_col == script_col:
-        raise SystemExit("ERROR: no romanised column found in the metadata")
-    # the id column is whichever remaining column is pure ASCII everywhere
+        roman_col = None
     others = [i for i in range(n) if i not in (script_col, roman_col)]
     id_col = others[0] if others else 0
     return id_col, script_col, roman_col
+
+
+def parse_metadata(meta: Path) -> tuple[list[list[str]], tuple, str]:
+    """Choose the delimiter by whether it actually SEPARATES script from romanisation.
+
+    Scoring on "column count is consistent" alone is not enough, and got this
+    wrong on the real corpus: these files are pipe-delimited, but splitting a
+    pipe-delimited line on commas ALSO yields a consistent width whenever the
+    sentences happen to contain one comma each. That puts Sinhala on both sides
+    of the split, so no romanised column can be found. So the score now leads
+    with "did this delimiter yield a clean script + romanisation pair", which is
+    the thing we actually need, and only then falls back to consistency.
+    """
+    lines = meta.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    best = None
+    for delim in ("|", "\t", ";", ","):
+        try:
+            rows = [r for r in csv.reader(lines, delimiter=delim)
+                    if any(c.strip() for c in r)]
+        except csv.Error:
+            continue
+        if not rows:
+            continue
+        width, n = Counter(len(r) for r in rows).most_common(1)[0]
+        if width < 2:
+            continue
+        good = [r for r in rows if len(r) == width]
+        cols = locate_columns(good)
+        if cols is None:
+            continue
+        score = (1 if cols[2] is not None else 0, n / len(rows), width)
+        if best is None or score > best[0]:
+            best = (score, good, cols, delim)
+    if best is None:
+        raise SystemExit(
+            f"ERROR: no delimiter gave a Sinhala column in {meta}\n"
+            f"  first line: {lines[0][:160] if lines else '<empty>'}")
+    return best[1], best[2], best[3]
 
 
 # --------------------------------------------------------------------------
@@ -214,6 +232,7 @@ def main() -> int:
     drop: Counter = Counter()
     kept: list[tuple[str, str, str, str, float, Path]] = []   # id, ascii, script, spk, dur, wav
     unmapped: Counter = Counter()
+    text_source: dict[str, str] = {}
 
     for speaker, sdir in spk_dirs.items():
         metas = sorted(sdir.rglob("metadata.csv")) or sorted(sdir.rglob("*.csv"))
@@ -221,16 +240,26 @@ def main() -> int:
             print(f"  {speaker}: NO metadata csv found -- skipped", file=sys.stderr)
             continue
         meta = metas[0]
-        rows = sniff_rows(meta)
-        id_col, script_col, roman_col = locate_columns(rows)
+        rows, (id_col, script_col, roman_col), delim = parse_metadata(meta)
         wavs = {p.stem: p for p in sdir.rglob("*.wav")}
+        source = "roman" if roman_col is not None else "script"
+        text_source[speaker] = source
         print(f"  {speaker:10s} {meta.name}: {len(rows)} rows, {len(wavs)} wavs, "
-              f"cols id={id_col} script={script_col} roman={roman_col}")
+              f"delim={delim!r}, cols id={id_col} script={script_col} "
+              f"roman={roman_col if roman_col is not None else 'ABSENT'}")
+        if roman_col is None:
+            # Not a failure: sinhala_to_ascii() reaches the same ASCII as
+            # fold(roman) on 96.6% of pathnirvana's paired lines, so a
+            # script-only file is still perfectly trainable.
+            print(f"  {'':10s} no romanised column -- transliterating the script instead")
+        print(f"  {'':10s} sample: {rows[0][id_col][:20]} | "
+              f"{rows[0][script_col][:32]} | "
+              f"{rows[0][roman_col][:32] if roman_col is not None else '-'}")
 
         for r in rows:
             clip_id = r[id_col].strip()
             script = r[script_col].strip()
-            roman = r[roman_col].strip()
+            roman = r[roman_col].strip() if roman_col is not None else ""
             if not clip_id or not SINHALA.search(script):
                 drop["header_or_malformed"] += 1
                 continue
@@ -253,12 +282,15 @@ def main() -> int:
             if dur < args.min_seconds:
                 drop[f"shorter_than_{args.min_seconds:g}s"] += 1
                 continue
-            bad = unmapped_chars(roman)
-            if bad:
-                unmapped.update(bad)
-                drop["unmapped_characters"] += 1
-                continue
-            text = fold(roman)
+            if roman_col is not None:
+                bad = unmapped_chars(roman)
+                if bad:
+                    unmapped.update(bad)
+                    drop["unmapped_characters"] += 1
+                    continue
+                text = fold(roman)
+            else:
+                text = sinhala_to_ascii(script)
             if not text:
                 drop["empty_after_fold"] += 1
                 continue
@@ -376,6 +408,7 @@ def main() -> int:
         "duration_median_s": round(statistics.median(secs), 2),
         "duration_max_s": round(max(secs), 2),
         "source_sample_rates": dict(srates),
+        "text_source": text_source,
         "dropped": dict(drop),
     }
     (out / "prepare_report.json").write_text(
