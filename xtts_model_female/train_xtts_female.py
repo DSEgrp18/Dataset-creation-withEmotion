@@ -107,7 +107,15 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--save-step", type=int, default=1000)
     ap.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 2))
+    # fp16 is OFF by default. It roughly doubles throughput, but on a Kaggle T4
+    # it drives loss_mel_ce straight to nan on this model and never recovers --
+    # an 8 hour run that produces only NaN checkpoints. Turing has no bf16, so
+    # there is no stable mixed-precision option on that card. Opt in only if you
+    # have verified finite losses on your GPU.
+    ap.add_argument("--mixed-precision", dest="amp", action="store_true",
+                    help="enable fp16 (~2x faster; produces nan on T4 -- verify first)")
     ap.add_argument("--no-mixed-precision", dest="amp", action="store_false")
+    ap.set_defaults(amp=False)
     ap.add_argument("--continue-path", default=None,
                     help="resume a run directory (Kaggle's 12 h session limit)")
     ap.add_argument("--smoke", action="store_true",

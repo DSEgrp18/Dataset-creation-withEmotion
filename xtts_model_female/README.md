@@ -107,7 +107,8 @@ text. This was caught by a deliberate negative test, not by reasoning.
 ## Deviations from the official recipe
 
 Everything in `GPTArgs`, `XttsAudioConfig` and the optimizer block is copied verbatim
-from `recipes/ljspeech/xtts_v2/train_gpt_xtts.py`. Four things differ:
+from `recipes/ljspeech/xtts_v2/train_gpt_xtts.py`. Three things differ, and one is
+deliberately left alone:
 
 **`language="en"`** selects a tokenizer branch, not a claim about the audio.
 `VoiceBpeTokenizer.preprocess_text` raises `NotImplementedError` outside its 17-language
@@ -122,8 +123,11 @@ about 400 steps — nowhere near enough to move the model onto a new sound inven
 **`lr=1e-5`, not `5e-6`**, compensating for the smaller batch. Drop back if
 `loss_mel_ce` gets noisy or rises.
 
-**`mixed_precision=True`**, roughly 2× throughput on a T4. The smoke run shows `nan`
-immediately if fp16 destabilises; pass `--no-mixed-precision` then.
+**`mixed_precision=False`** — the upstream default, and the only workable one here. fp16
+roughly doubles throughput but drives `loss_mel_ce` to `nan` on a Kaggle T4 on the
+first step, and it never recovers: an 8-hour run that writes only NaN checkpoints and
+exits cleanly. Turing has no bf16, so there is no stable mixed-precision option on that
+card. `--mixed-precision` opts in if you have verified finite losses on your GPU.
 
 One thing that *looks* like a deviation but is not: the scheduler milestones are
 `[900000, 2700000, 5400000]` and `Trainer` defaults to `scheduler_after_epoch=True`, so
@@ -148,6 +152,19 @@ Real multi-GPU would roughly double throughput and is worth trying *after* a sin
 baseline succeeds: it needs `python -m trainer.distribute --script train_xtts_female.py …`,
 `optimizer_wd_only_on_weights=False`, and `CUDA_VISIBLE_DEVICES` left unset. Every failed
 attempt costs a whole Kaggle session, which is why it is not the default.
+
+---
+
+## The smoke test asserts finite losses
+
+`--smoke` runs a handful of steps on 64 clips. Its job is to catch the one failure a
+zero exit code does **not** reveal: `loss_mel_ce: nan`. A diverged run trains happily for
+eight hours, writes NaN checkpoints and exits 0, so the notebook parses the smoke log and
+raises if any loss is non-finite. The long training loop repeats the check on its
+heartbeat and aborts if the loss has been `nan` for three consecutive reports.
+
+That guard exists because a real run burned an entire session at `nan` before it was
+added — the exit code was 0 the whole way.
 
 ---
 
