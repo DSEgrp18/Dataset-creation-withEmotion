@@ -44,6 +44,32 @@ WHAT TO WATCH
     loss_mel_ce is the acoustic reconstruction term and the only loss that tracks
     audio quality. loss_text_ce carries weight 0.01 in the total.
 
+DISK BUDGET -- READ THIS BEFORE POINTING --out AT /kaggle/working
+----------------------------------------------------------------
+A GPTTrainer checkpoint carries the model AND the AdamW state, so each one is
+~5.5 GB. The trainer keeps more of them at once than `save_n_checkpoints=1`
+suggests, because `trainer.io.save_best_model` writes the new best and then
+`fs.copy()`s it to `best_model.pth` -- a full second copy, not a symlink. So the
+steady state is:
+
+    base model files                          ~2.1 GB
+    best_model_<step>.pth                     ~5.5 GB
+    best_model.pth        (copy of the above) ~5.5 GB
+    checkpoint_<step>.pth (periodic)          ~5.5 GB
+                                              ~18.6 GB steady
+    + the next best model, written before the old one is deleted
+                                              ~24.1 GB peak
+
+/kaggle/working is a 20 GB volume, so a run pointed there dies with
+`OSError: [Errno 28] No space left on device` at the second best-model save --
+around global step 1760 at these settings, roughly 45 minutes in. Worse, it takes
+the notebook with it: papermill writes __notebook__.ipynb to the same volume, so
+a full disk truncates the JSON mid-write and the whole session's output is lost.
+
+Train into /kaggle/temp (hundreds of GB) and copy only what you need back to
+/kaggle/working. --min-free-gb refuses to start when the target volume cannot
+hold the peak, so this fails in three seconds instead of forty-five minutes.
+
 USAGE
     python train_xtts_female.py --dataset ./female_dataset --out ./run --smoke
     python train_xtts_female.py --dataset ./female_dataset --out ./run --epochs 40
@@ -56,6 +82,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -100,6 +127,17 @@ def fetch_base(dest: Path) -> dict[str, str]:
     return {name: str(dest / name) for name in LINKS}
 
 
+def free_gb(path: Path) -> float:
+    """Free space on the volume holding `path`, in GB.
+
+    Walks up to the nearest existing ancestor, so this works before the run
+    directory has been created.
+    """
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return shutil.disk_usage(path).free / 1e9
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -122,9 +160,33 @@ def main() -> int:
     ap.set_defaults(amp=False)
     ap.add_argument("--continue-path", default=None,
                     help="resume a run directory (Kaggle's 12 h session limit)")
+    # 25 GB is the peak in the DISK BUDGET note above, rounded up. A run that
+    # cannot hold it will die mid-save hours later; refuse it now instead.
+    ap.add_argument("--min-free-gb", type=float, default=25.0,
+                    help="refuse to start unless --out has this much free (0 disables)")
     ap.add_argument("--smoke", action="store_true",
                     help="a few steps on a tiny slice, to prove the wiring")
     args = ap.parse_args()
+
+    dataset = Path(args.dataset).resolve()
+    out = Path(args.out).resolve() / "training"
+
+    # Ahead of the TTS imports and the base-model download, so a run that cannot
+    # possibly finish costs a second rather than the forty-five minutes it takes
+    # to reach the second best-model save and die there. See DISK BUDGET in the
+    # module docstring for where the number comes from.
+    have = free_gb(out)
+    print(f"disk: {have:.1f} GB free at {out}")
+    if args.min_free_gb and have < args.min_free_gb:
+        print(
+            f"\nERROR: {have:.1f} GB free, need {args.min_free_gb:.0f} GB.\n"
+            "  A GPTTrainer checkpoint is ~5.5 GB and the trainer holds up to four\n"
+            "  at once (best_model_<step>.pth, its best_model.pth copy, one periodic\n"
+            "  checkpoint, and the next best written before the old is deleted).\n"
+            "  On Kaggle: train into /kaggle/temp, not the 20 GB /kaggle/working.\n"
+            "  Pass --min-free-gb 0 to override.",
+            file=sys.stderr)
+        return 1
 
     from trainer import Trainer, TrainerArgs
     from TTS.config.shared_configs import BaseDatasetConfig
@@ -132,8 +194,6 @@ def main() -> int:
     from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig
     from TTS.tts.models.xtts import XttsAudioConfig
 
-    dataset = Path(args.dataset).resolve()
-    out = Path(args.out).resolve() / "training"
     out.mkdir(parents=True, exist_ok=True)
     base = fetch_base(out / "XTTS_v2.0_original_model_files")
 

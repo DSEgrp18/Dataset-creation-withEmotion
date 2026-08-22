@@ -155,6 +155,50 @@ attempt costs a whole Kaggle session, which is why it is not the default.
 
 ---
 
+## Disk budget — why training does not run in `/kaggle/working`
+
+A GPTTrainer checkpoint carries the model **and** the AdamW state, so each one is
+~5.5 GB. `save_n_checkpoints=1` suggests only one survives at a time. Four do:
+
+| On disk during a run | |
+|---|---|
+| base model files | ~2.1 GB |
+| `best_model_<step>.pth` | ~5.5 GB |
+| `best_model.pth` | ~5.5 GB |
+| `checkpoint_<step>.pth` (periodic) | ~5.5 GB |
+| **steady state** | **~18.6 GB** |
+| + the next best model, written *before* the old one is deleted | **~24.1 GB peak** |
+
+The second row of 5.5 GB is the one that is easy to miss: `trainer.io.save_best_model`
+ends with `fs.copy(checkpoint_path, "best_model.pth")` — a **full second copy**, not a
+symlink or a hardlink.
+
+`/kaggle/working` is a 20 GB volume, so a run pointed there reaches
+`OSError: [Errno 28] No space left on device` at the *second* best-model save — global
+step 1760 at these settings, about 45 minutes in. The smoke test survives it only
+because it writes two best models and no periodic checkpoint, peaking at ~18.6 GB.
+
+**It also destroys the notebook.** papermill writes `__notebook__.ipynb` to the same
+volume, so a full disk truncates the JSON mid-write and the session ends with
+`NotJSONError: Notebook does not appear to be JSON` — every cell's output gone, not
+just the training cell's.
+
+So: training writes to `/kaggle/temp` (hundreds of GB), and the notebook mirrors
+`config.json` + `best_model.pth` back to `/kaggle/working/run` when it stops. Those two
+files are the whole resume kit — `best_model.pth` carries the optimizer state, so
+`--continue-path` on that directory picks up where the session left off.
+
+Two guards back that up, mirroring the two NaN guards:
+
+- **`--min-free-gb` (default 25)** refuses to start when the target volume cannot hold
+  the peak. It runs *before* the TTS imports and the base-model download, so a doomed
+  run costs a second instead of forty-five minutes.
+- **The notebook's disk guard** checks free space every 30 s — not on the 10-minute
+  heartbeat, because one checkpoint save can fill a volume between reports — and stops
+  training while there is still room to finish writing. Unlike the NaN guard it does
+  **not** raise: a disk-stopped checkpoint is perfectly good, so evaluation and export
+  still run on it.
+
 ## The smoke test asserts finite losses
 
 `--smoke` runs a handful of steps on 64 clips. Its job is to catch the one failure a
