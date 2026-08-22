@@ -36,6 +36,18 @@ _FINITE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$")
 _KEYS = ("loss_mel_ce", "EPOCH", "EVAL", "BEST", "STEP:")
 _NOISE = ("it/s", "iB/s")
 
+# For the curves. The trainer prints the step on its own line, ahead of the
+# losses it belongs to:
+#     --> TIME: ... -- STEP: 350/879 -- GLOBAL_STEP: 350
+#          | > loss_mel_ce: 3.4930  (3.7744)
+_STEP = re.compile(r"GLOBAL_STEP:\s*(\d+)")
+# "> loss_mel_ce" only. "> avg_loss_mel_ce" cannot match this, because the
+# characters right after "> " are "avg_" -- which is what separates the running
+# training loss from an epoch or eval average.
+_TRAIN_LOSS = re.compile(r">\s*loss_mel_ce:\s*(\S+)")
+_AVG_LOSS = re.compile(r">\s*avg_loss_mel_ce:\s*(\S+)")
+_BEST = re.compile(r"BEST MODEL\s*:.*?best_model_(\d+)\.pth")
+
 
 def strip_ansi(text: str) -> str:
     return _ANSI.sub("", text)
@@ -72,6 +84,76 @@ def interesting(text: str, limit: int | None = None) -> list[str]:
     lines = [l.strip() for l in strip_ansi(text).splitlines()
              if any(k in l for k in _KEYS) and not any(n in l for n in _NOISE)]
     return lines[-limit:] if limit else lines
+
+
+def series(text: str) -> dict:
+    """Loss curves, as {"train": [(step, loss)], "eval": [...], "best": [step]}.
+
+    The trainer prints an average under two different headings and they mean
+    opposite things: under `> EVALUATION` it is held-out loss, and anywhere else
+    it is the training epoch average. Plotting the training average as if it were
+    eval would hide overfitting completely -- the two curves would be the same
+    curve -- so the block heading is tracked rather than the line matched alone.
+    """
+    train: list[tuple[int, float]] = []
+    evals: list[tuple[int, float]] = []
+    best: list[int] = []
+    step, in_eval = 0, False
+
+    for line in strip_ansi(text).splitlines():
+        m = _STEP.search(line)
+        if m:
+            step, in_eval = int(m.group(1)), False
+        if "EVALUATION" in line:
+            in_eval = True
+        elif "EPOCH:" in line:
+            in_eval = False
+
+        m = _BEST.search(line)
+        if m:
+            best.append(int(m.group(1)))
+            continue
+        m = _AVG_LOSS.search(line)
+        if m:
+            if is_finite(m.group(1)):
+                (evals if in_eval else train).append((step, float(m.group(1))))
+            continue
+        m = _TRAIN_LOSS.search(line)
+        if m and is_finite(m.group(1)):
+            train.append((step, float(m.group(1))))
+
+    return {"train": train, "eval": evals, "best": best}
+
+
+def verdict(evals, patience: int = 2, rise: float = 0.01) -> tuple[str, str]:
+    """Read the eval curve: (label, one-line explanation).
+
+    Labels are `improving`, `plateau`, `overfitting`, `too-short`. The point of
+    the distinction is which checkpoint to export -- on `overfitting` the last
+    checkpoint is worse than one you already have, so export `best_model.pth`
+    and not the final step.
+
+    `rise` is relative, because loss scale differs between runs; 0.01 is 1 %
+    above the minimum, comfortably outside eval noise on this model.
+    """
+    pts = [(s, v) for s, v in evals if v == v]        # drop nan
+    if len(pts) < 3:
+        return "too-short", f"only {len(pts)} eval points -- train longer before reading this"
+
+    losses_ = [v for _, v in pts]
+    i_best = min(range(len(losses_)), key=losses_.__getitem__)
+    best_v, last_v = losses_[i_best], losses_[-1]
+    after = len(losses_) - 1 - i_best
+
+    if after == 0:
+        return "improving", (f"eval loss is still at its minimum ({best_v:.4f}) at the last "
+                             f"point -- the run stopped early, not because it converged")
+    if after >= patience and last_v > best_v * (1 + rise):
+        return "overfitting", (
+            f"eval bottomed at {best_v:.4f} (step {pts[i_best][0]}) and has risen to "
+            f"{last_v:.4f} over {after} evals -- export best_model.pth, not the last step")
+    return "plateau", (f"eval best {best_v:.4f} at step {pts[i_best][0]}, now {last_v:.4f} "
+                       f"-- flat within noise for {after} evals")
 
 
 def _selftest() -> None:
@@ -114,6 +196,52 @@ def _selftest() -> None:
     assert interesting(healthy, 2) == [
         "| > avg_loss_mel_ce: 3.8380595048268638 (+0.0)",
         "| > avg_loss_mel_ce: 3.6631078720092773 (-0.1749516328175864)"]
+
+    # --- series() -------------------------------------------------------
+    # Verbatim shape of the real run, including the coloured eval average and
+    # the BEST MODEL line that carries the exact step.
+    run = (
+        "--> TIME: 2026-08-19 10:59:45 -- STEP: 350/879 -- GLOBAL_STEP: 350\n"
+        "     | > loss_mel_ce: 3.493067979812622  (3.774454493522644)\n"
+        "--> TIME: 2026-08-19 11:10:23 -- STEP: 800/879 -- GLOBAL_STEP: 800\n"
+        "     | > loss_mel_ce: 3.054823160171509  (3.491334294974804)\n"
+        "\x1b[1m > EVALUATION \x1b[0m\n"
+        "  \x1b[1m--> EVAL PERFORMANCE\x1b[0m\n"
+        "     | > avg_loss_mel_ce:\x1b[92m 3.189875941527517 \x1b[0m(+0.0)\n"
+        " > BEST MODEL : /kaggle/temp/run/training/x/best_model_880.pth\n"
+        "\x1b[4m\x1b[1m > EPOCH: 1/39\x1b[0m\n"
+        "--> TIME: 2026-08-19 11:20:46 -- STEP: 320/879 -- GLOBAL_STEP: 1200\n"
+        "     | > loss_mel_ce: 3.3386614322662354  (3.0876808032393463)\n"
+        "\x1b[1m > EVALUATION \x1b[0m\n"
+        "     | > avg_loss_mel_ce:\x1b[92m 3.020407877470318 \x1b[0m(-0.169)\n"
+        " > BEST MODEL : /kaggle/temp/run/training/x/best_model_1760.pth\n"
+    )
+    s = series(run)
+    assert s["train"] == [(350, 3.493067979812622), (800, 3.054823160171509),
+                          (1200, 3.3386614322662354)], s["train"]
+    # The eval averages must NOT have leaked into the training curve, and must
+    # carry the step of the training point they follow.
+    assert s["eval"] == [(800, 3.189875941527517), (1200, 3.020407877470318)], s["eval"]
+    assert s["best"] == [880, 1760], s["best"]
+
+    # A training epoch average is not an eval point.
+    epoch_avg = (" > EPOCH: 2/39\n"
+                 "     | > avg_loss_mel_ce: 2.9 (+0.0)\n")
+    assert series(epoch_avg)["eval"] == []
+    assert series(epoch_avg)["train"] == [(0, 2.9)]
+
+    # nan values are dropped from the curves rather than plotted as gaps.
+    assert series(" | > loss_mel_ce: nan  (nan)\n")["train"] == []
+
+    # --- verdict() ------------------------------------------------------
+    assert verdict([(1, 3.0), (2, 2.9)])[0] == "too-short"
+    assert verdict([(1, 3.0), (2, 2.9), (3, 2.8)])[0] == "improving"
+    # Risen well clear of the minimum, and stayed there.
+    assert verdict([(1, 3.0), (2, 2.5), (3, 2.7), (4, 2.9)])[0] == "overfitting"
+    # Within 1 % of the minimum is noise, not overfitting.
+    assert verdict([(1, 3.0), (2, 2.5), (3, 2.505), (4, 2.51)])[0] == "plateau"
+    # One bad eval after the minimum is not yet a verdict of overfitting.
+    assert verdict([(1, 3.0), (2, 2.9), (3, 2.5), (4, 2.9)], patience=2)[0] == "plateau"
 
     print("train_log selftest OK")
 

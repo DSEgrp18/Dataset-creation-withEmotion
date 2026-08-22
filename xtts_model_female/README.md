@@ -44,6 +44,9 @@ female audio (~2 h). This corpus has ~7 h of it.
 | [`listening_test.py`](listening_test.py) | builds the MOS + SUS panel as one self-contained HTML file |
 | [`score_listening.py`](score_listening.py) | rater CSVs → MOS and SUS numbers, split by rater group |
 | [`kaggle_xtts_female.ipynb`](kaggle_xtts_female.ipynb) | Run All |
+| [`plot_training.py`](plot_training.py) | train vs held-out loss curves, and an overfitting verdict |
+| [`next_run_report.py`](next_run_report.py) | assembles `next_run.md` — everything needed to plan the next run |
+| [`train_log.py`](train_log.py) | log parsing for the guards and the curves; run it to selftest |
 | [`RESULTS.md`](RESULTS.md) | one row per finished run — the only way these metrics mean anything |
 | [`calibrate_mcd.py`](calibrate_mcd.py) | what this script's MCD scale actually is, measured on known pairs |
 
@@ -271,16 +274,28 @@ Two things to know:
 
 ## What to send back after the Kaggle run
 
-To improve the next iteration:
+**`next_run.md`.** The last cell of the notebook writes it, and it is self-contained —
+dataset composition, how training went, the objective table, and a ranked list of what
+to change, each item carrying the evidence that produced it. Collecting these by hand
+after an eight-hour session is exactly when things get forgotten, and Kaggle deletes the
+session shortly afterwards.
 
-1. `eval_out/report.md` — the objective table
-2. the tail of `train.log`, especially `loss_mel_ce` and the eval lines
-3. `prepare_report.json` — how many clips survived and what was dropped
-4. two or three synthesised wavs, ideally alongside the real recording of the same sentence
+[`next_run_report.py`](next_run_report.py) derives the recommendations rather than
+printing a checklist:
 
-The most useful single number is **`loss_mel_ce` at the end versus its minimum**. If the
-minimum came well before the end, it is overfitting and the export should come from
-`best_model.pth` rather than the last checkpoint.
+| It notices | Because |
+|---|---|
+| the run stopped before converging | eval loss was still at its minimum at the last eval |
+| the last checkpoint is not the best | eval turned up while train kept falling |
+| the epoch count does not fit a session | measured s/step × steps/epoch × epochs against the 8.5 h budget |
+| a speaker gap is confounded | the weaker speaker has *both* less audio and a different `text_source` |
+| generation is failing | failure rate or a duration ratio away from 1.0 |
+
+Alongside it, send two or three synthesised wavs, ideally beside the real recording of
+the same sentence — no metric substitutes for hearing it.
+
+The most useful single number remains **`loss_mel_ce` at the end versus its minimum**;
+[`plot_training.py`](plot_training.py) plots exactly that and states the verdict.
 
 ---
 
