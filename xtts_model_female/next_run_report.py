@@ -99,7 +99,7 @@ def metric(block: dict, key: str):
     return v["mean"] if isinstance(v, dict) else v
 
 
-def build(prep, log, metrics, run_dir, dataset_dir) -> tuple[str, list]:
+def build(prep, log, metrics, run_dir, dataset_dir, status=None) -> tuple[str, list]:
     """Returns (markdown, findings). Findings are (severity, title, evidence, action)."""
     out: list[str] = []
     findings: list[tuple[str, str, str, str]] = []
@@ -187,6 +187,50 @@ def build(prep, log, metrics, run_dir, dataset_dir) -> tuple[str, list]:
         w("")
         w(f"**Curve verdict: `{log['verdict']}`** — {log['why']}")
         w("")
+
+        # Why it stopped is the first question a short run raises, and the log
+        # alone cannot answer it: budget, nan, disk and a crash all look the same
+        # once the process is gone. The notebook records it while it still knows.
+        REASONS = {
+            "budget": "the {budget:.1f} h training budget was reached",
+            "nan": "the loss went nan and the guard aborted it",
+            "disk": "the disk guard stopped it",
+            "process_exit": "**the training process exited on its own**",
+            "epochs_done": "it finished all requested epochs",
+        }
+        if status:
+            reason = status.get("reason", "unknown")
+            line = REASONS.get(reason, f"unrecorded (`{reason}`)").format(
+                budget=status.get("budget_h", 0))
+            w(f"**Why it stopped:** {line}"
+              + (f" (exit code {status['returncode']})"
+                 if status.get("returncode") not in (None, 0) else "") + ".")
+            w("")
+            used, budget = status.get("wall_h"), status.get("budget_h")
+            if used and budget and used < 0.6 * budget and reason != "epochs_done":
+                evidence = f"Stop reason recorded as `{reason}`"
+                if reason == "process_exit":
+                    evidence += f", exit code {status.get('returncode')}"
+                evidence += f". Used {used:.2f} h of {budget:.1f} h."
+                if log.get("sec_per_step"):
+                    lost = int((budget - used) * 3600 / log["sec_per_step"])
+                    evidence += (f" At {log['sec_per_step']:.2f} s/step the unused "
+                                 f"{budget - used:.1f} h was worth about {lost:,} "
+                                 f"more steps — roughly "
+                                 f"{lost / max(log.get('steps_per_epoch') or 1, 1):.0f} "
+                                 f"more epochs.")
+                findings.append((
+                    "do first",
+                    f"Training used only {used:.1f} h of its {budget:.1f} h budget",
+                    evidence,
+                    "This, not the epoch count, is why the run is short. A run that "
+                    "stops at 2 h will stop at 2 h again, and each attempt costs a "
+                    "session — so diagnose it before resuming. The log tail is in "
+                    "section 6."))
+        else:
+            w("**Why it stopped:** not recorded. Re-run with the notebook's training "
+              "cell, which now writes `run_status.json`.")
+            w("")
 
         if log["verdict"] == "improving":
             findings.append((
@@ -332,6 +376,19 @@ def build(prep, log, metrics, run_dir, dataset_dir) -> tuple[str, list]:
     w("Attach the previous session's output as an input first; `best_model.pth` carries "
       "the optimizer state, so a resume continues rather than restarts.")
     w("")
+
+    # The last thing the trainer said before it died. When a run ends for an
+    # unrecorded reason this is the only evidence there is, and the session that
+    # held it is deleted shortly after this file is written.
+    tail = (status or {}).get("log_tail")
+    if tail:
+        w("## 6. Last lines of train.log")
+        w("")
+        w("```")
+        for line in tail:
+            w(line)
+        w("```")
+        w("")
     w("---")
     w("")
     w("Append the headline numbers to `RESULTS.md` before starting the next run — that "
@@ -346,6 +403,8 @@ def main() -> int:
     ap.add_argument("--log", default="/kaggle/working/train.log")
     ap.add_argument("--eval", help="evaluate_xtts.py output dir")
     ap.add_argument("--run", help="training run directory")
+    ap.add_argument("--status", default=None,
+                    help="run_status.json written by the notebook's training cell")
     ap.add_argument("--out", default="/kaggle/working/next_run.md")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -358,13 +417,16 @@ def main() -> int:
     log_path = Path(args.log)
     log = parse_log(log_path.read_text(encoding="utf-8", errors="replace")) \
         if log_path.is_file() else None
+    status_path = Path(args.status) if args.status else log_path.with_name("run_status.json")
+    status = read_json(status_path)
 
     for label, ok in (("prepare_report.json", prep is not None),
                       ("train.log", log is not None),
-                      ("eval metrics.json", metrics is not None)):
+                      ("eval metrics.json", metrics is not None),
+                      ("run_status.json", status is not None)):
         print(f"  {'found' if ok else 'MISSING'}  {label}")
 
-    md, findings = build(prep, log, metrics, args.run, args.dataset)
+    md, findings = build(prep, log, metrics, args.run, args.dataset, status)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(md, encoding="utf-8")
@@ -423,8 +485,28 @@ def _selftest() -> int:
     assert abs(log["wall_h"] - 2.0166) < 0.01, log["wall_h"]
     assert log["verdict"] == "too-short", log["verdict"]   # only 2 evals
 
+    # The case that matters most: the process died on its own, far short of the
+    # budget, and the log tail is the only evidence of why.
+    status = {"reason": "process_exit", "returncode": 1, "wall_h": 2.27,
+              "budget_h": 8.5, "log_tail": ["torch.OutOfMemoryError: CUDA out of memory"]}
+    md, findings = build(prep, log, metrics, "/x/GPT_XTTS_si_female-run", "/x/ds", status)
+    titles = " | ".join(t for _, t, _, _ in findings)
+    assert "used only 2.3 h of its 8.5 h budget" in titles, titles
+    assert findings[0][0] == "do first"
+    assert "the training process exited on its own" in md and "exit code 1" in md
+    assert "CUDA out of memory" in md and "## 6. Last lines of train.log" in md
+    ev = next(f[2] for f in findings if "budget" in f[1])
+    assert "more steps" in ev and "more epochs" in ev, ev
+
+    # A budget-exhausted run is doing what it was told; no early-stop finding.
+    _, f_ok = build(prep, log, metrics, "/x/r", "/x/ds",
+                    {"reason": "budget", "wall_h": 8.4, "budget_h": 8.5})
+    assert not any("budget" in t for _, t, _, _ in f_ok), \
+        [t for _, t, _, _ in f_ok]
+
     md, findings = build(prep, log, metrics, "/x/GPT_XTTS_si_female-run", "/x/ds")
     titles = " | ".join(t for _, t, _, _ in findings)
+    assert "not recorded" in md      # no status file -> say so, do not guess
 
     # The three findings this run must produce, each from a different input.
     assert "transliteration fallback" in titles, titles

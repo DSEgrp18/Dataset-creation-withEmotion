@@ -14,7 +14,8 @@ changed `evaluate_xtts.py`, that is a new row.
 
 | # | Date | Checkpoint | Steps | MCD | F0 corr | SECS | Fail % | UTMOS synth / real |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 2026-08-19 | `GPT_XTTS_si_female-August-19-2026_12+15PM-b292719` | ~5 k (unconfirmed) | 63.13 | 0.399 | 0.700 | 2.5 | 2.74 / 3.27 |
+| 1 | 2026-08-19 | `GPT_XTTS_si_female-August-19-2026_12+15PM-b292719` | ~5 000 | 63.13 | 0.399 | 0.700 | 2.5 | 2.74 / 3.27 |
+| 2 | 2026-08-22 | `GPT_XTTS_si_female-August-22-2026_11+42AM-3c817d0` | 5 850 | 63.34 | 0.384 | 0.701 | 1.2 | 2.73 / 3.27 |
 
 ---
 
@@ -117,6 +118,80 @@ The run directory is stamped `12+15PM` and `model.pth` was last written at `14:1
 right, every number above is from a substantially undertrained model and there is real
 headroom left. The training-cell tail would settle it: budget reached, disk guard, or an
 unprompted exit. **Not yet confirmed.**
+
+---
+
+## Run 2 — 2026-08-22
+
+`GPT_XTTS_si_female-August-22-2026_11+42AM-3c817d0`
+
+Same dataset and configuration as Run 1. The pipeline produced `curves.png` and
+`next_run.md` automatically for the first time.
+
+### Training
+
+| | |
+|---|---|
+| reached | global step **5 850**, epoch **6 of 40** |
+| wall clock | **2.27 h** at **1.39 s/step** |
+| train `loss_mel_ce` | 4.6359 → 2.5994 over 118 points |
+| eval `loss_mel_ce` | best **2.8442 at step 5 250** — the last of 6 evals |
+| curve verdict | **`improving`** — every eval was better than the one before |
+
+The curve is textbook: train falling with noise, eval falling smoothly and
+monotonically, no divergence, no gap opening. **Nothing about this run says the model
+had stopped learning.** It stopped for an external reason.
+
+### Results
+
+| Scope | MCD dB | log-F0 RMSE | F0 corr | SECS | Dur. ratio | Fail % | RTF |
+|---|---|---|---|---|---|---|---|
+| best_model | 63.34 | 357.8 | 0.384 | 0.701 | 0.994 | 1.2 | 0.554 |
+| dinithi | 61.03 | 315.6 | 0.534 | 0.677 | 1.020 | 0.0 | 0.557 |
+| harini | 65.64 | 400.0 | 0.233 | 0.724 | 0.968 | 2.5 | 0.550 |
+
+| Scope | UTMOS synth | UTMOS real |
+|---|---|---|
+| best_model | 2.73 | 3.27 |
+| dinithi | 2.71 | 3.37 |
+| harini | 2.75 | 3.17 |
+
+### Run 1 vs Run 2 — an accidental repeatability measurement
+
+Both runs stopped at essentially the same amount of training (≈5 000 vs 5 850 steps,
+both epoch 5–6 of 40), on the same data and configuration. So the difference between
+them is **mostly evaluation noise, and that makes it useful**: it is the first estimate
+of what counts as a real change in this pipeline.
+
+| Metric | Run 1 | Run 2 | Δ |
+|---|---|---|---|
+| MCD dB | 63.13 | 63.34 | +0.21 |
+| log-F0 RMSE | 359.5 | 357.8 | −1.7 |
+| F0 corr | 0.399 | 0.384 | −0.015 |
+| SECS | 0.700 | 0.701 | +0.001 |
+| duration ratio | 0.968 | 0.994 | +0.026 |
+| failure rate | 2.5 % | 1.2 % | −1.3 pt |
+| UTMOS | 2.74 | 2.73 | −0.01 |
+
+**Read: a change smaller than ~0.3 dB MCD or ~0.02 F0 corr is not evidence of anything.**
+The `compare_quality.py` tolerances (2 % of MCD ≈ 1.3 dB, 0.02 on F0 corr) sit just
+outside this spread, which is the right side to be on.
+
+Two real improvements did land, both plausibly from the extra 850 steps: duration ratio
+moved from 0.968 to 0.994, and the failure rate halved. Those are the metrics that track
+autoregressive stability, and they are the ones that improve first.
+
+### Why this run did not beat Run 1
+
+**Because it trained the same amount.** Both stopped around epoch 6 of 40, at ~2.3 h of
+an 8.5 h budget. Nothing was learned about the model between them; what was learned is
+that *the run stops early for a reason neither report captured.*
+
+That gap is now closed: the training cell records `run_status.json` (stop reason, exit
+code, wall clock against budget, and the last 40 log lines), and `next_run_report.py`
+puts it at the top of section 2 and raises a **do first** finding when a run uses less
+than 60 % of its budget. Run 3 will say which of budget, NaN guard, disk guard or an
+unexpected process exit ended it.
 
 ---
 
