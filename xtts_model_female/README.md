@@ -44,6 +44,8 @@ female audio (~2 h). This corpus has ~7 h of it.
 | [`listening_test.py`](listening_test.py) | builds the MOS + SUS panel as one self-contained HTML file |
 | [`score_listening.py`](score_listening.py) | rater CSVs → MOS and SUS numbers, split by rater group |
 | [`kaggle_xtts_female.ipynb`](kaggle_xtts_female.ipynb) | Run All |
+| [`RESULTS.md`](RESULTS.md) | one row per finished run — the only way these metrics mean anything |
+| [`calibrate_mcd.py`](calibrate_mcd.py) | what this script's MCD scale actually is, measured on known pairs |
 
 Local equivalent:
 
