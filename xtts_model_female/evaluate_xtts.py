@@ -336,6 +336,19 @@ def main() -> int:
             "failure_rate": round(
                 sum(1 for r in subset if r.get("failed")) / max(len(subset), 1), 4),
         }
+        # The same numbers over the clips that did NOT fail generation.
+        #
+        # A truncated or looping clip still gets an MCD, and it is a terrible one,
+        # so a handful of failures moves the mean by more than a real change in
+        # the model does. Two runs compared on the pooled mean alone can therefore
+        # look like "the model got worse" when what actually happened is "three
+        # clips blew up" -- which has a different fix. Reporting both separates
+        # generation stability (failure_rate) from spectral accuracy (the _ok
+        # figures) instead of blending them into one number.
+        ok = [r for r in subset if not r.get("failed")]
+        d["clips_ok"] = len(ok)
+        for key in ("mcd_db", "f0_rmse_cents", "f0_corr", "secs"):
+            d[key + "_ok"] = agg([r.get(key) for r in ok])
         if any("utmos" in r for r in subset):
             d["utmos"] = agg([r.get("utmos") for r in subset])
             d["utmos_real"] = agg([r.get("utmos_real") for r in subset])
@@ -374,6 +387,21 @@ def main() -> int:
             f"{cell(d['f0_corr'], nd=3)} | {cell(d['secs'], nd=3)} | "
             f"{cell(d['duration_ratio'], nd=3)} | {100*d['failure_rate']:.1f} | "
             f"{cell(d['rtf'], nd=3)} |")
+    if any(d["clips_ok"] < d["clips"] for d in [overall] + per_speaker):
+        lines += [
+            "",
+            "Excluding clips that failed generation, so a few truncated or looping "
+            "clips cannot masquerade as a worse model. Compare THESE across runs, "
+            "and read `Fail %` above as its own signal:",
+            "",
+            "| Scope | Clips used | MCD dB | log-F0 RMSE | F0 corr | SECS |",
+            "|---|---|---|---|---|---|",
+        ]
+        for d in [overall] + per_speaker:
+            lines.append(
+                f"| {d['name']} | {d['clips_ok']}/{d['clips']} | "
+                f"{cell(d.get('mcd_db_ok'))} | {cell(d.get('f0_rmse_cents_ok'), nd=1)} | "
+                f"{cell(d.get('f0_corr_ok'), nd=3)} | {cell(d.get('secs_ok'), nd=3)} |")
     if "utmos" in overall:
         lines += ["", "| Scope | UTMOS synth | UTMOS real recordings |", "|---|---|---|"]
         for d in [overall] + per_speaker:

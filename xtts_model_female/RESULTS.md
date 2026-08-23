@@ -17,6 +17,7 @@ changed `evaluate_xtts.py`, that is a new row.
 | 1 | 2026-08-19 | `GPT_XTTS_si_female-August-19-2026_12+15PM-b292719` | ~5 000 | 63.13 | 0.399 | 0.700 | 2.5 | 2.74 / 3.27 |
 | 2 | 2026-08-22 | `GPT_XTTS_si_female-August-22-2026_11+42AM-3c817d0` | 5 850 | 63.34 | 0.384 | 0.701 | 1.2 | 2.73 / 3.27 |
 | 3 | 2026-08-22 | `GPT_XTTS_si_female-August-22-2026_04+41PM-03c7fa2` | 5 850 | 63.04 | 0.429 | 0.705 | **0.0** | — |
+| 4 | 2026-08-23 | first run past the OOM ceiling — best at step **15 800** | ~22 000 | 63.67 | 0.407 | 0.704 | 3.8 | 2.68 / 3.27 |
 
 ---
 
@@ -277,16 +278,98 @@ discovering that training stops at epoch 6, and the third one found out why.
 
 ---
 
+## Run 4 — 2026-08-23 — converged, and the first real information
+
+The OOM fix worked: **~22 000 steps (~25 epochs) against the 5 850 every earlier run was
+capped at.** This is the first run whose result says anything about the model rather than
+about the harness.
+
+### Training
+
+| | |
+|---|---|
+| steps | ~22 000, ~25 epochs |
+| eval `loss_mel_ce` | best **2.7480 at step 15 800**, ending 2.7743 |
+| verdict | **`plateau`** — flat within noise for 7 evals |
+| train `loss_mel_ce` | ~2.28 at the end |
+
+The shape is unambiguous. Eval falls steeply to ~10 000, flattens, bottoms at 15 800, and
+**turns very slightly upward** while train keeps falling to 2.28. The train/eval gap opens
+from ~0.1 early to **~0.49** at the end.
+
+**Training longer is finished as a lever.** 2.850 → 2.748 is a real 3.6 % improvement in
+held-out loss, and it is all the improvement there was; steps 15 800–22 000 bought nothing
+and began to cost.
+
+### Results
+
+| Scope | MCD dB | log-F0 RMSE | F0 corr | SECS | Dur. ratio | Fail % | RTF |
+|---|---|---|---|---|---|---|---|
+| best_model | 63.67 | 353.4 | 0.407 | 0.704 | 1.026 | 3.8 | 0.495 |
+| dinithi | 61.88 | 326.1 | 0.528 | 0.681 | **1.057** | 5.0 | 0.495 |
+| harini | 65.46 | 380.8 | 0.287 | 0.728 | 0.995 | 2.5 | 0.495 |
+
+UTMOS 2.68 synth / 3.27 real (dinithi 2.70/3.37, harini 2.66/3.17).
+
+### 3.8× the training did not improve the output
+
+| Metric | Run 3 (5 850 steps) | Run 4 (best @ 15 800) | beyond noise? |
+|---|---|---|---|
+| **eval loss** | 2.8503 | **2.7480** | yes — the only clear win |
+| MCD dB | 63.04 | 63.67 | see below |
+| F0 corr | 0.429 | 0.407 | no (spread 0.045) |
+| SECS | 0.705 | 0.704 | no |
+| duration ratio | 0.982 | 1.026 | marginal |
+| failure rate | 0.0 % | **3.8 %** | **yes — worse** |
+| UTMOS | 2.73 | **2.68** | **yes — worse** |
+
+**The MCD difference is probably not real.** Failed clips are included in the pooled MCD
+mean, and a truncated or looping clip scores catastrophically — on the calibration scale
+above, near the 108–154 "unrelated speech" band. Three such clips in 80 shift the mean by
+several dB on their own, which is far more than the 0.63 dB separating these two runs.
+Run 3 had zero failures; Run 4 has three. `evaluate_xtts.py` now reports a second table
+over non-failed clips only, so future comparisons do not confuse "the model got worse"
+with "three clips blew up" — those have different fixes.
+
+**What is real: the model is over-generating.** Failure rate 0 → 3.8 %, duration ratio
+0.982 → 1.026, and dinithi at **1.057** — 5.7 % longer than the reference. UTMOS down 0.05
+against a run-to-run spread of 0.01. All four point the same way: the autoregressive
+decoder is running past where it should stop.
+
+That is the classic cost of training an AR TTS model to convergence on a small corpus.
+The model grows confident on training-like sequences, and stop-token prediction degrades
+on held-out text. The loss says it fits better; the generator says it is less stable.
+
+### The state of things after four runs
+
+**6.81 h of audio gets XTTS-v2 to roughly `loss_mel_ce` 2.75 and no further, and quality
+tops out before the loss does.** Nothing in the training configuration is now the binding
+constraint. The next gains have to come from data or from decoding, not from more steps.
+
+---
+
 ## Next experiments, in order of expected value
 
-1. **Get past step 5850.** Every run so far has been capped there by allocator
-   fragmentation, at epoch 6 of 40. With `expandable_segments:True` and the OOM ladder
-   in place, the next run should reach the 8.5 h budget — roughly 24 000 steps, ~27
-   epochs. Nothing else on this list is worth doing until that happens, because every
-   comparison so far has been between models trained for identical, tiny amounts.
-2. **Transliterate dinithi's text too**, to decouple text path from data volume in the
-   harini gap.
-3. **MOS / SUS panel.** `listening_test.py` already wrote `listening_test.html` (8.7 MB,
-   audio embedded). Have a native speaker vet `answer_key.json` for ungrammatical SUS items
-   first, then report blind and sighted raters separately.
-4. **More harini**, if (2) says the gap is data volume rather than spelling.
+Revised after Run 4. **Training longer is no longer on this list** — eval loss bottomed at
+step 15 800 and rose after, so the training configuration has stopped being the binding
+constraint. ~~Get past step 5850~~ is done.
+
+1. **Fix the over-generation, at decode time — costs no GPU hours.** Failure rate 0 → 3.8 %
+   and duration ratio 1.026 (dinithi 1.057) are the only clear regressions, and both are
+   decoding behaviour, not weights. Sweep `--temperature` down from 0.75 (try 0.65, 0.6)
+   and `repetition_penalty` up from 5.0 on the *existing* checkpoint, and read
+   `failure_rate` and `duration_ratio` from the non-failed table. If failures go to zero
+   without MCD moving, that is a free win over Run 4 and it is the cheapest thing here.
+2. **Evaluate an earlier checkpoint against step 15 800.** Run 3's model (~step 5 250) had
+   0 % failures and a better UTMOS at a worse loss. If an intermediate checkpoint beats
+   both, "best eval loss" is the wrong export criterion for this model and the export
+   should follow UTMOS/failure rate instead. Cheap: `evaluate_xtts.py --checkpoint`.
+3. **MOS / SUS panel.** Now genuinely worth the effort — the model has converged, and no
+   objective metric here can say whether `loss_mel_ce` 2.75 *sounds* acceptable in Sinhala.
+   `listening_test.html` is already built. Have a native speaker vet `answer_key.json` for
+   ungrammatical SUS items first, then report blind and sighted raters separately.
+4. **Transliterate dinithi's text too**, to decouple text path from data volume in the
+   harini gap (F0 corr 0.287 vs 0.528, and it has persisted across all four runs).
+5. **More audio, especially harini.** With training converged at 6.81 h, this is the only
+   lever left that raises the ceiling rather than moving along it. The radio-drama corpus
+   upstream is the obvious source once it is diarised.
