@@ -95,6 +95,25 @@ from pathlib import Path
 # This must run before torch is imported, hence module level rather than main().
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
+# Fragmentation, not capacity, is what ends a long run on a 16 GB card. A real
+# run died at step 5850 after two healthy hours with:
+#
+#   OutOfMemoryError: Tried to allocate 14.00 MiB. GPU 0 has 14.56 GiB total of
+#   which 14.81 MiB is free ... 1.08 GiB is reserved by PyTorch but unallocated.
+#
+# A 14 MiB allocation failing beside a gigabyte of reserved-but-unallocated
+# memory is the caching allocator unable to find a CONTIGUOUS block, not a batch
+# that does not fit -- one of those dies in the first minute, not the third hour.
+# Clip lengths vary and batch_group_size=48 re-sorts them, so block sizes keep
+# changing and the heap slowly fragments. expandable_segments lets the allocator
+# grow one segment instead of juggling fixed blocks, which is torch's own advice
+# in that traceback. Must be set before torch is imported.
+#
+# PYTORCH_ALLOC_CONF is the current name; PYTORCH_CUDA_ALLOC_CONF is the older
+# one still honoured by torch 2.x. Setting both covers whichever Kaggle ships.
+for _var in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+    os.environ.setdefault(_var, "expandable_segments:True")
+
 _HERE = Path(__file__).resolve().parent
 for _cand in (_HERE, _HERE.parent / "xtts_sinhala"):
     if (_cand / "sinhala_text.py").is_file():

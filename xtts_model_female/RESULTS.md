@@ -16,6 +16,7 @@ changed `evaluate_xtts.py`, that is a new row.
 |---|---|---|---|---|---|---|---|---|
 | 1 | 2026-08-19 | `GPT_XTTS_si_female-August-19-2026_12+15PM-b292719` | ~5 000 | 63.13 | 0.399 | 0.700 | 2.5 | 2.74 / 3.27 |
 | 2 | 2026-08-22 | `GPT_XTTS_si_female-August-22-2026_11+42AM-3c817d0` | 5 850 | 63.34 | 0.384 | 0.701 | 1.2 | 2.73 / 3.27 |
+| 3 | 2026-08-22 | `GPT_XTTS_si_female-August-22-2026_04+41PM-03c7fa2` | 5 850 | 63.04 | 0.429 | 0.705 | **0.0** | — |
 
 ---
 
@@ -195,10 +196,94 @@ unexpected process exit ended it.
 
 ---
 
+## Run 3 — 2026-08-22 — the one that found the ceiling
+
+`GPT_XTTS_si_female-August-22-2026_04+41PM-03c7fa2`
+
+Same data and configuration again. This run carried the new `run_status.json`
+instrumentation, and it answered the question the first two could not.
+
+### Why every run stopped at step 5850
+
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 14.00 MiB.
+GPU 0 has a total capacity of 14.56 GiB of which 14.81 MiB is free.
+Of the allocated memory 13.31 GiB is allocated by PyTorch,
+and 1.08 GiB is reserved by PyTorch but unallocated.
+```
+
+**This is fragmentation, not a batch that is too large**, and the traceback says so
+itself. Three things establish it:
+
+- the failing allocation is **14 MiB** — trivially small
+- **1.08 GiB is reserved but unallocated** — the memory exists, it is not contiguous
+- it ran **two healthy hours** first. A batch that does not fit fails in the first
+  minute, not the third hour.
+
+Clip lengths vary and `batch_group_size=48` re-sorts them, so block sizes keep changing
+and the caching allocator's heap slowly fragments until no contiguous block is left.
+
+**Runs 2 and 3 both died at exactly global step 5850, both with eval best at step 5250.**
+Same data, same seed, same batch order — the fragmentation is deterministic, so it
+recurs at precisely the same step. Every run so far has been capped at epoch 6 of 40 by
+this and nothing else.
+
+### Fixes applied
+
+| Change | Where |
+|---|---|
+| `PYTORCH_ALLOC_CONF=expandable_segments:True` (and the older `PYTORCH_CUDA_ALLOC_CONF`), set before torch imports | `train_xtts_female.py` |
+| OOM retry ladder `(4×16) → (3×21) → (2×32)`, resuming from the checkpoint the failed attempt reached, sharing the remaining budget | notebook training cell |
+| OOM named explicitly as a finding, with its own fix, instead of the generic "short run" advice | `next_run_report.py` |
+
+The ladder halves peak activation memory per rung while holding
+`batch_size × grad_accum` near 64, so the effective batch — and the learning dynamics —
+barely move. It only retries on a genuine OOM with more than ten minutes of budget left;
+NaN, disk and budget stops break out immediately, because a smaller batch changes
+nothing for those.
+
+### Results
+
+| Scope | MCD dB | log-F0 RMSE | F0 corr | SECS | Dur. ratio | Fail % | RTF |
+|---|---|---|---|---|---|---|---|
+| best_model | 63.04 | 342.3 | 0.429 | 0.705 | 0.982 | **0.0** | 0.520 |
+| dinithi | 60.22 | 308.1 | 0.556 | 0.691 | 1.007 | 0.0 | 0.519 |
+| harini | 65.85 | 376.5 | 0.301 | 0.718 | 0.956 | 0.0 | 0.522 |
+
+Training: step 5 850, epoch 6/40, **2.02 h at 1.24 s/step**, eval best **2.8503 at step
+5 250**, verdict `improving` — every one of the 6 evals beat the one before it.
+
+### Three runs at the same step count
+
+| Metric | Run 1 | Run 2 | Run 3 | spread |
+|---|---|---|---|---|
+| MCD dB | 63.13 | 63.34 | 63.04 | 0.30 |
+| log-F0 RMSE | 359.5 | 357.8 | 342.3 | 17.2 |
+| F0 corr | 0.399 | 0.384 | 0.429 | 0.045 |
+| SECS | 0.700 | 0.701 | 0.705 | 0.005 |
+| failure rate | 2.5 % | 1.2 % | 0.0 % | 2.5 pt |
+| harini F0 corr | 0.248 | 0.233 | 0.301 | 0.068 |
+
+All three trained the same amount, so this spread is **the pipeline's noise floor, not
+progress**. Run 3 is nominally best on almost every metric, and that is exactly the trap
+this table exists to prevent: at ±0.3 dB MCD and ±0.045 F0 corr, none of the differences
+between these runs mean anything. Do not read Run 3 as an improvement over Run 2.
+
+The one movement that looks real is **failure rate 2.5 % → 1.2 % → 0.0 %**, monotone
+across three runs. Worth watching, not yet worth believing.
+
+**The honest summary of runs 1–3: no model progress at all.** Three sessions were spent
+discovering that training stops at epoch 6, and the third one found out why.
+
+---
+
 ## Next experiments, in order of expected value
 
-1. **Train longer.** Nothing else is worth tuning until a run has used its full budget.
-   Resume from the mirror with `--continue-path`.
+1. **Get past step 5850.** Every run so far has been capped there by allocator
+   fragmentation, at epoch 6 of 40. With `expandable_segments:True` and the OOM ladder
+   in place, the next run should reach the 8.5 h budget — roughly 24 000 steps, ~27
+   epochs. Nothing else on this list is worth doing until that happens, because every
+   comparison so far has been between models trained for identical, tiny amounts.
 2. **Transliterate dinithi's text too**, to decouple text path from data volume in the
    harini gap.
 3. **MOS / SUS panel.** `listening_test.py` already wrote `listening_test.html` (8.7 MB,

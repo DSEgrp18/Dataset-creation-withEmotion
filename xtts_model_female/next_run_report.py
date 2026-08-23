@@ -219,14 +219,31 @@ def build(prep, log, metrics, run_dir, dataset_dir, status=None) -> tuple[str, l
                                  f"more steps — roughly "
                                  f"{lost / max(log.get('steps_per_epoch') or 1, 1):.0f} "
                                  f"more epochs.")
-                findings.append((
-                    "do first",
-                    f"Training used only {used:.1f} h of its {budget:.1f} h budget",
-                    evidence,
-                    "This, not the epoch count, is why the run is short. A run that "
-                    "stops at 2 h will stop at 2 h again, and each attempt costs a "
-                    "session — so diagnose it before resuming. The log tail is in "
-                    "section 6."))
+                tail_txt = " ".join(status.get("log_tail") or [])
+                if "OutOfMemoryError" in tail_txt or "CUDA out of memory" in tail_txt:
+                    findings.append((
+                        "do first",
+                        "CUDA ran out of memory mid-run — this is fragmentation, "
+                        "not too large a batch",
+                        evidence + " The traceback shows a tiny allocation failing "
+                        "while a large block sits reserved-but-unallocated, and the "
+                        "run had already trained for hours. A batch that does not fit "
+                        "fails in the first minute; this is the allocator unable to "
+                        "find a contiguous block in a heap it has fragmented.",
+                        "Set PYTORCH_ALLOC_CONF=expandable_segments:True (torch's own "
+                        "suggestion in that traceback) and drop --batch-size while "
+                        "raising --grad-accum to keep the effective batch near 64. "
+                        "Both are already applied in train_xtts_female.py and the "
+                        "notebook's retry ladder."))
+                else:
+                    findings.append((
+                        "do first",
+                        f"Training used only {used:.1f} h of its {budget:.1f} h budget",
+                        evidence,
+                        "This, not the epoch count, is why the run is short. A run that "
+                        "stops at 2 h will stop at 2 h again, and each attempt costs a "
+                        "session — so diagnose it before resuming. The log tail is in "
+                        "section 6."))
         else:
             w("**Why it stopped:** not recorded. Re-run with the notebook's training "
               "cell, which now writes `run_status.json`.")
@@ -491,11 +508,24 @@ def _selftest() -> int:
               "budget_h": 8.5, "log_tail": ["torch.OutOfMemoryError: CUDA out of memory"]}
     md, findings = build(prep, log, metrics, "/x/GPT_XTTS_si_female-run", "/x/ds", status)
     titles = " | ".join(t for _, t, _, _ in findings)
-    assert "used only 2.3 h of its 8.5 h budget" in titles, titles
+    # An OOM is named as such, not reported as a generic short run: the fix is
+    # specific and the generic advice ("diagnose it") would waste a session.
+    assert "CUDA ran out of memory" in titles, titles
     assert findings[0][0] == "do first"
     assert "the training process exited on its own" in md and "exit code 1" in md
     assert "CUDA out of memory" in md and "## 6. Last lines of train.log" in md
-    ev = next(f[2] for f in findings if "budget" in f[1])
+    ev = next(f[2] for f in findings if "CUDA" in f[1])
+    assert "fragmented" in ev and "2.27" in ev, ev
+    assert "expandable_segments" in next(f[3] for f in findings if "CUDA" in f[1])
+
+    # A short run that did NOT OOM falls back to the generic budget finding.
+    _, f_gen = build(prep, log, metrics, "/x/r", "/x/ds",
+                     {"reason": "process_exit", "returncode": 1, "wall_h": 2.27,
+                      "budget_h": 8.5, "log_tail": ["Killed"]})
+    gen = " | ".join(t for _, t, _, _ in f_gen)
+    assert "used only 2.3 h of its 8.5 h budget" in gen, gen
+    assert "CUDA" not in gen, gen
+    ev = next(f[2] for f in f_gen if "budget" in f[1])
     assert "more steps" in ev and "more epochs" in ev, ev
 
     # A budget-exhausted run is doing what it was told; no early-stop finding.
