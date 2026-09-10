@@ -439,20 +439,33 @@ def _selftest() -> int:
     assert sl < full / 4, (full, sl)
     assert hf < sl, (sl, hf)
 
-    # --verify: passes on the real slim file, and fails when a weight is altered.
-    assert verify(tmp / "full.pth", tmp / "slim.pth") == 0
-    assert verify(tmp / "full.pth", tmp / "half.pth") == 0
+    # --verify, on four files. The last two MUST fail, so their reports say
+    # FAILED -- banners here because an unlabelled FAILED in the output of a
+    # passing selftest is indistinguishable from a broken one.
+    def expect(code, label, *args):
+        print(f"\n--- selftest: {label} (expecting "
+              f"{'PASS' if code == 0 else 'FAILURE'}) ---")
+        got = verify(*args)
+        assert got == code, f"{label}: verify returned {got}, expected {code}"
+
+    expect(0, "the real slim file", tmp / "full.pth", tmp / "slim.pth")
+    expect(0, "the fp16 file", tmp / "full.pth", tmp / "half.pth")
+    # A weight altered by 1e-7 -- far below any tolerance, which is the point:
+    # bit-identity has no tolerance, so this has to be caught.
     tampered = {"model": dict(slim_state["model"])}
     tampered["model"]["gpt.weight"] = gpt_w + 1e-7
     torch.save(tampered, tmp / "tampered.pth")
-    assert verify(tmp / "full.pth", tmp / "tampered.pth") == 1
+    expect(1, "a weight altered by 1e-7", tmp / "full.pth", tmp / "tampered.pth")
     short = {"model": {k: v for k, v in slim_state["model"].items()
                        if k != "hifigan_decoder.weight"}}
     torch.save(short, tmp / "short.pth")
-    assert verify(tmp / "full.pth", tmp / "short.pth") == 1
+    expect(1, "a missing tensor", tmp / "full.pth", tmp / "short.pth")
 
-    print(f"optimize_checkpoint selftest OK  "
-          f"({full/1e6:.1f} MB -> {sl/1e6:.1f} MB -> {hf/1e6:.1f} MB fp16)")
+    def size(n):
+        return f"{n/1e6:.1f} MB" if n >= 1e6 else f"{n/1e3:.0f} kB"
+
+    print(f"\noptimize_checkpoint selftest OK  "
+          f"({size(full)} -> {size(sl)} strip -> {size(hf)} fp16)")
     return 0
 
 
