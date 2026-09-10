@@ -173,8 +173,32 @@ def main() -> int:
     ap.add_argument("--out", default="./eval_out")
     ap.add_argument("--checkpoint", default=None, help="override the .pth choice")
     ap.add_argument("--n", type=int, default=40, help="eval clips per speaker")
-    ap.add_argument("--temperature", type=float, default=0.75)
     ap.add_argument("--seed", type=int, default=1234)
+    # Decoding. The defaults are the values this script used when it was hard
+    # coded, so every number already in RESULTS.md is still reproducible by
+    # passing nothing. They are exposed because truncation, looping and
+    # over-generation are decoding behaviour, not weights -- run 4 regressed to
+    # 3.8 % failures and duration ratio 1.026 on a checkpoint whose eval loss
+    # was the best yet, and that is fixable here for no GPU hours. Sweep with
+    # sweep_eval.py rather than one flag at a time.
+    ap.add_argument("--temperature", type=float, default=0.75,
+                    help="lower = less sampling variance, less looping")
+    ap.add_argument("--repetition-penalty", type=float, default=5.0,
+                    help="higher discourages the repeated-token loop")
+    ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--top-p", type=float, default=0.85)
+    ap.add_argument("--length-penalty", type=float, default=1.0)
+    # The two female speakers reached ASCII by different routes: dinithi through
+    # fold(romanisation), harini through sinhala_to_ascii(script), because her
+    # metadata carries no romanised column. Those agree on only ~96.6 % of lines,
+    # so harini's text is systematically spelled a little differently from the
+    # text the pretrained tokens were learned on. --text-from script re-derives
+    # every speaker's text from the Sinhala column through sinhala_to_ascii, so
+    # both speakers go down ONE path. That is the inference half of the
+    # experiment; prepare_voicemakers.py --text-path script is the training half.
+    ap.add_argument("--text-from", choices=("dataset", "script"), default="dataset",
+                    help="dataset: the ascii prepare_voicemakers.py wrote. "
+                         "script: re-transliterate the Sinhala for every speaker")
     ap.add_argument("--utmos", action="store_true", help="add the UTMOS predictor")
     ap.add_argument("--asr", default=None, metavar="MODEL",
                     help="e.g. openai/whisper-large-v3 -- adds the CER gap")
@@ -186,6 +210,13 @@ def main() -> int:
     import torchaudio
     from TTS.tts.configs.xtts_config import XttsConfig
     from TTS.tts.models.xtts import Xtts
+
+    _here = Path(__file__).resolve().parent
+    for _cand in (_here, _here.parent / "xtts_sinhala"):
+        if (_cand / "sinhala_text.py").is_file():
+            sys.path.insert(0, str(_cand))
+            break
+    from sinhala_text import sinhala_to_ascii
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -228,6 +259,20 @@ def main() -> int:
     model.to(device)
 
     # ------------------------------------------------------- synthesise
+    # One text path for both speakers when asked for it. Recorded per clip so a
+    # report can show exactly what was spoken, not just which flag was passed.
+    if args.text_from == "script":
+        changed = 0
+        for it in items:
+            unified = sinhala_to_ascii(it["sinhala"])
+            if unified != it["ascii"]:
+                changed += 1
+            it["ascii_dataset"], it["ascii"] = it["ascii"], unified
+        print(f"text path  : unified sinhala_to_ascii -- "
+              f"{changed}/{len(items)} clips differ from the dataset's ascii")
+    else:
+        print("text path  : as prepared (dinithi fold(roman), harini script)")
+
     print("\nsynthesising")
     rows = []
     for i, it in enumerate(items, 1):
@@ -247,8 +292,9 @@ def main() -> int:
         res = model.inference(
             text=it["ascii"], language="en",
             gpt_cond_latent=gpt_latent, speaker_embedding=spk_emb,
-            temperature=args.temperature, length_penalty=1.0,
-            repetition_penalty=5.0, top_k=50, top_p=0.85,
+            temperature=args.temperature, length_penalty=args.length_penalty,
+            repetition_penalty=args.repetition_penalty,
+            top_k=args.top_k, top_p=args.top_p,
             enable_text_splitting=False,
         )
         elapsed = time.time() - t0
@@ -362,8 +408,16 @@ def main() -> int:
     overall = summarise(rows, args.label or ckpt.stem)
     per_speaker = [summarise([r for r in rows if r["speaker"] == s], s)
                    for s in sorted(by_spk)]
+    # The decode config is part of the result, not a detail of how it was run:
+    # two rows of RESULTS.md are only comparable if this block matches.
+    decode = {"temperature": args.temperature,
+              "repetition_penalty": args.repetition_penalty,
+              "top_k": args.top_k, "top_p": args.top_p,
+              "length_penalty": args.length_penalty,
+              "text_from": args.text_from}
     metrics = {"checkpoint": str(ckpt), "n_clips": len(rows),
                "temperature": args.temperature, "seed": args.seed,
+               "decode": decode,
                "overall": overall, "per_speaker": per_speaker}
     (out / "metrics.json").write_text(
         json.dumps({"metrics": metrics, "clips": rows}, indent=1, ensure_ascii=False),
@@ -376,7 +430,8 @@ def main() -> int:
         f"# XTTS Sinhala female -- objective evaluation",
         "",
         f"- checkpoint: `{ckpt.name}`",
-        f"- clips: {len(rows)}  (temperature {args.temperature}, seed {args.seed})",
+        f"- clips: {len(rows)}  (seed {args.seed})",
+        "- decode: " + ", ".join(f"{k} {v}" for k, v in decode.items()),
         "",
         "| Scope | MCD dB | log-F0 RMSE (cents) | F0 corr | SECS | Dur. ratio | Fail % | RTF |",
         "|---|---|---|---|---|---|---|---|",

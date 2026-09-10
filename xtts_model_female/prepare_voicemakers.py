@@ -205,6 +205,28 @@ def main() -> int:
                     help="held-out clips per speaker, used by evaluate_xtts.py")
     ap.add_argument("--keep-digits", action="store_true",
                     help="keep rows containing digits (see the docstring -- do not)")
+    # Which route each speaker's text takes to ASCII. "auto" is what every run in
+    # RESULTS.md used: fold(romanisation) where the column exists, transliteration
+    # otherwise -- so dinithi and harini came down DIFFERENT paths, and those two
+    # paths agree on only ~96.6 % of lines. harini is worse on every metric except
+    # SECS, but she also has less than half the data, so the text path and the data
+    # volume are confounded. "script" puts both speakers on sinhala_to_ascii and
+    # decouples them. Nothing else changes.
+    ap.add_argument("--text-path", choices=("auto", "roman", "script"), default="auto",
+                    help="auto: romanised column when present (default, as every "
+                         "previous run). script: transliterate the Sinhala for "
+                         "EVERY speaker. roman: require the romanised column.")
+    # Dinithi has 2462 clips to harini's 1135, so ~68 %% of gradient steps teach
+    # dinithi's voice. Repeating the minority speaker's rows evens out how often
+    # each speaker is seen per epoch. Done here, in the metadata, rather than with
+    # a sampler inside the trainer: GPTTrainer builds its own loader, and a
+    # duplicated row is visible in metadata_train.csv and in the report, which a
+    # sampler weight is not. Epochs get longer; steps per epoch are printed.
+    ap.add_argument("--balance-speakers", choices=("none", "oversample"),
+                    default="none",
+                    help="oversample: repeat minority speakers' TRAIN rows until "
+                         "every speaker has as many as the largest. The eval split "
+                         "is never touched.")
     ap.add_argument("--copy-wavs", action="store_true",
                     help="copy instead of symlink (needed on filesystems without links)")
     ap.add_argument("--seed", type=int, default=1234)
@@ -242,11 +264,22 @@ def main() -> int:
         meta = metas[0]
         rows, (id_col, script_col, roman_col), delim = parse_metadata(meta)
         wavs = {p.stem: p for p in sdir.rglob("*.wav")}
-        source = "roman" if roman_col is not None else "script"
+        # --text-path decides which column is used; roman_col says which exist.
+        if args.text_path == "script":
+            source = "script"
+        elif args.text_path == "roman":
+            if roman_col is None:
+                print(f"  ERROR: {speaker} has no romanised column and "
+                      "--text-path roman was requested", file=sys.stderr)
+                return 6
+            source = "roman"
+        else:
+            source = "roman" if roman_col is not None else "script"
         text_source[speaker] = source
         print(f"  {speaker:10s} {meta.name}: {len(rows)} rows, {len(wavs)} wavs, "
               f"delim={delim!r}, cols id={id_col} script={script_col} "
               f"roman={roman_col if roman_col is not None else 'ABSENT'}")
+        print(f"  {'':10s} text path: {source}")
         if roman_col is None:
             # Not a failure: sinhala_to_ascii() reaches the same ASCII as
             # fold(roman) on 96.6% of pathnirvana's paired lines, so a
@@ -282,7 +315,11 @@ def main() -> int:
             if dur < args.min_seconds:
                 drop[f"shorter_than_{args.min_seconds:g}s"] += 1
                 continue
-            if roman_col is not None:
+            if source == "roman":
+                # Only when the romanisation is what gets used. fold() silently
+                # DELETES characters it does not map, turning one word into
+                # another, so an unmapped diacritic has to stop the run -- but it
+                # is irrelevant when the text comes from the script column.
                 bad = unmapped_chars(roman)
                 if bad:
                     unmapped.update(bad)
@@ -377,6 +414,33 @@ def main() -> int:
         n_eval = min(args.eval_per_speaker, len(rows_s) // 10)
         eval_rows += rows_s[:n_eval]
         train_rows += rows_s[n_eval:]
+    # Speaker balancing, on the TRAIN split only -- duplicating eval rows would
+    # weight the metrics instead of the training, which is the opposite of useful.
+    balance = {"mode": args.balance_speakers,
+               "train_clips_before": {s: sum(1 for r in train_rows if r[3] == s)
+                                      for s in sorted(by_speaker)}}
+    if args.balance_speakers == "oversample":
+        per_spk = defaultdict(list)
+        for row in train_rows:
+            per_spk[row[3]].append(row)
+        target = max(len(v) for v in per_spk.values())
+        extra = []
+        for speaker, rows_s in per_spk.items():
+            need = target - len(rows_s)
+            if need <= 0:
+                continue
+            # Cycle through the speaker's own rows in a shuffled order, so the
+            # duplicates are spread over the whole set rather than repeating the
+            # first few clips many times.
+            pool = list(rows_s)
+            rng.shuffle(pool)
+            extra += [pool[i % len(pool)] for i in range(need)]
+        train_rows += extra
+        balance["target_per_speaker"] = target
+        balance["duplicated_rows"] = len(extra)
+    balance["train_clips_after"] = {s: sum(1 for r in train_rows if r[3] == s)
+                                    for s in sorted(by_speaker)}
+
     rng.shuffle(train_rows)
     rng.shuffle(eval_rows)
 
@@ -408,7 +472,9 @@ def main() -> int:
         "duration_median_s": round(statistics.median(secs), 2),
         "duration_max_s": round(max(secs), 2),
         "source_sample_rates": dict(srates),
+        "text_path": args.text_path,
         "text_source": text_source,
+        "balance": balance,
         "dropped": dict(drop),
     }
     (out / "prepare_report.json").write_text(
@@ -419,6 +485,12 @@ def main() -> int:
           f"total {report['total_hours']} h")
     for s, v in per_spk.items():
         print(f"    {s:10s} {v['clips']:5d} clips   {v['hours']:.2f} h")
+    print(f"  text path: {args.text_path}  -> {text_source}")
+    if args.balance_speakers != "none":
+        print(f"  balancing: {args.balance_speakers}, "
+              f"{balance['duplicated_rows']} rows duplicated")
+        print(f"    before {balance['train_clips_before']}")
+        print(f"    after  {balance['train_clips_after']}")
     print(f"  duration : median {report['duration_median_s']}s  "
           f"max {report['duration_max_s']}s")
     print(f"  source sample rates: {dict(srates)}  "

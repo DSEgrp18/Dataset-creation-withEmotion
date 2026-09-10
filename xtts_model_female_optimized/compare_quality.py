@@ -46,7 +46,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-EVAL = Path(__file__).resolve().parent.parent / "xtts_model_female" / "evaluate_xtts.py"
+_FEMALE = Path(__file__).resolve().parent.parent / "xtts_model_female"
+EVAL = _FEMALE / "evaluate_xtts.py"
+
+# The experiment register lives with the sweep driver so a gate result and a
+# sweep row are the same kind of row, in the same file, with the same columns.
+sys.path.insert(0, str(_FEMALE))
+try:
+    from sweep_eval import append_row, row_from_metrics
+except ImportError:                              # pragma: no cover
+    append_row = row_from_metrics = None
 
 # key, higher_is_better, tolerance, kind ("rel" fraction | "abs")
 GATES = [
@@ -61,29 +70,47 @@ GATES = [
 UNGATED = ("rtf",)
 
 
-def value(metrics: dict, key: str):
-    """Pull one number out of evaluate_xtts's overall block."""
-    v = metrics["overall"].get(key)
+def value(metrics: dict, key: str, speaker: str | None = None):
+    """Pull one number out of evaluate_xtts's overall, or one speaker's, block."""
+    block = metrics["overall"]
+    if speaker is not None:
+        blocks = [d for d in metrics.get("per_speaker", []) if d["name"] == speaker]
+        if not blocks:
+            return None
+        block = blocks[0]
+    v = block.get(key)
     if v is None:
         return None
     return v["mean"] if isinstance(v, dict) else v
 
 
-def run_eval(ckpt: Path, out: Path, args, seed: int) -> dict:
+def run_eval(ckpt: Path, out: Path, args, seed: int, label: str) -> dict:
+    metrics_path = out / "metrics.json"
+    # Already measured: reuse it. A Kaggle session can end between the baseline
+    # and the candidate, and re-running would both cost the GPU time again and
+    # overwrite a result that is already recorded.
+    if metrics_path.is_file() and not args.force:
+        print(f"reusing {metrics_path}  (--force to re-run)", flush=True)
+        return json.loads(metrics_path.read_text(encoding="utf-8"))["metrics"]
     cmd = [sys.executable, str(EVAL), "--run", args.run, "--base", args.base,
            "--dataset", args.dataset, "--checkpoint", str(ckpt),
            "--out", str(out), "--n", str(args.n), "--seed", str(seed),
-           "--temperature", str(args.temperature), "--label", ckpt.stem]
+           "--temperature", str(args.temperature),
+           "--repetition-penalty", str(args.repetition_penalty),
+           "--top-k", str(args.top_k), "--top-p", str(args.top_p),
+           "--length-penalty", str(args.length_penalty),
+           "--text-from", args.text_from,
+           "--label", label]
     if args.utmos:
         cmd.append("--utmos")
     print("$", " ".join(cmd), flush=True)
     if subprocess.run(cmd).returncode != 0:
         raise SystemExit(f"evaluation failed for {ckpt}")
-    return json.loads((out / "metrics.json").read_text(encoding="utf-8"))["metrics"]
+    return json.loads(metrics_path.read_text(encoding="utf-8"))["metrics"]
 
 
-def averaged(runs: list[dict], key: str):
-    vals = [v for v in (value(m, key) for m in runs) if v is not None]
+def averaged(runs: list[dict], key: str, speaker: str | None = None):
+    vals = [v for v in (value(m, key, speaker) for m in runs) if v is not None]
     return statistics.fmean(vals) if vals else None
 
 
@@ -99,8 +126,29 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=40, help="eval clips per speaker")
     ap.add_argument("--seeds", default="1234",
                     help="comma-separated; metrics are averaged over them")
+    # Decoding must be IDENTICAL on both sides or the comparison measures the
+    # decode change instead of the checkpoint change. One set of flags, passed to
+    # both evaluations, is the only way to keep that true.
     ap.add_argument("--temperature", type=float, default=0.75)
+    ap.add_argument("--repetition-penalty", type=float, default=5.0)
+    ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--top-p", type=float, default=0.85)
+    ap.add_argument("--length-penalty", type=float, default=1.0)
+    ap.add_argument("--text-from", choices=("dataset", "script"), default="dataset")
     ap.add_argument("--utmos", action="store_true")
+    ap.add_argument("--registry", default=None,
+                    help="append both sides to this experiment register CSV "
+                         "(default <out>/experiments.csv)")
+    ap.add_argument("--force", action="store_true",
+                    help="re-run evaluations that already have a metrics.json")
+    # Per-speaker regressions are REPORTED always and gated only on request. Each
+    # speaker has half the clips, so the noise floor per speaker is wider than the
+    # pooled one the tolerances were sized against -- RESULTS.md measured harini's
+    # F0 corr moving 0.068 across three runs that trained identically. Promoting
+    # that to a hard failure would reject changes for noise; ignoring it would
+    # miss a change that helps one speaker by hurting the other.
+    ap.add_argument("--gate-per-speaker", action="store_true",
+                    help="treat a per-speaker regression as a failure, not a warning")
     args = ap.parse_args()
 
     if not EVAL.is_file():
@@ -116,8 +164,10 @@ def main() -> int:
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     base_runs, cand_runs = [], []
     for seed in seeds:
-        base_runs.append(run_eval(base_ck, out / f"baseline_s{seed}", args, seed))
-        cand_runs.append(run_eval(cand_ck, out / f"candidate_s{seed}", args, seed))
+        base_runs.append(run_eval(base_ck, out / f"baseline_s{seed}", args, seed,
+                                  f"baseline-{base_ck.stem}"))
+        cand_runs.append(run_eval(cand_ck, out / f"candidate_s{seed}", args, seed,
+                                  f"candidate-{cand_ck.stem}"))
 
     size_b, size_c = base_ck.stat().st_size, cand_ck.stat().st_size
 
@@ -126,6 +176,10 @@ def main() -> int:
     print(f"candidate : {cand_ck.name}   {size_c/1e9:.2f} GB   "
           f"({100*(1-size_c/size_b):+.0f}% size)")
     print(f"seeds     : {seeds}   clips/speaker: {args.n}")
+    print(f"decode    : temperature {args.temperature}, repetition_penalty "
+          f"{args.repetition_penalty}, top_k {args.top_k}, top_p {args.top_p}, "
+          f"length_penalty {args.length_penalty}, text_from {args.text_from}"
+          "   (identical on both sides)")
     print("=" * 78)
     print(f"\n{'metric':<16}{'baseline':>12}{'candidate':>12}{'change':>12}   verdict")
     print("-" * 78)
@@ -164,6 +218,59 @@ def main() -> int:
             print(f"{key:<16}{b:>12.4f}{c:>12.4f}{c-b:>+12.4f}   (not gated)")
 
     print("-" * 78)
+
+    # ------------------------------------------------------- per speaker
+    # An overall mean can hold still while a change helps dinithi and hurts
+    # harini, and that gap has persisted across every run in RESULTS.md -- so it
+    # is the one place an averaged verdict is most likely to mislead.
+    warnings = []
+    speakers = sorted({d["name"] for m in base_runs for d in m.get("per_speaker", [])})
+    if speakers:
+        print(f"\nPer speaker ({args.n} clips each -- half the pooled n, so a "
+              f"wider noise floor):")
+        print(f"\n{'speaker / metric':<26}{'baseline':>11}{'candidate':>11}"
+              f"{'change':>11}   verdict")
+        print("-" * 78)
+        for spk in speakers:
+            for key, higher_better, tol, kind in GATES:
+                b = averaged(base_runs, key, spk)
+                c = averaged(cand_runs, key, spk)
+                if b is None or c is None:
+                    continue
+                allowed = tol * abs(b) if kind == "rel" else tol
+                worse_by = -(c - b) if higher_better else (c - b)
+                ok = worse_by <= allowed
+                if not ok:
+                    msg = (f"{spk} {key}: {b:.4f} -> {c:.4f} "
+                           f"(worse by {worse_by:.4f}, allowed {allowed:.4f})")
+                    (failures if args.gate_per_speaker else warnings).append(msg)
+                print(f"{spk + ' ' + key:<26}{b:>11.4f}{c:>11.4f}{c - b:>+11.4f}"
+                      f"   {'ok' if ok else ('REGRESSED' if args.gate_per_speaker else 'worse')}")
+        print("-" * 78)
+
+    if warnings:
+        print(f"\n{len(warnings)} per-speaker metric(s) moved beyond the pooled "
+              "tolerance:")
+        for w in warnings:
+            print("  -", w)
+        print("These are NOT gated by default -- each speaker has half the clips, "
+              "so the\nnoise floor is wider than the tolerances were sized for. They "
+              "are also not\nnothing: re-run with --seeds 1234,1235,1236 before "
+              "deciding, or --gate-per-speaker\nto make them fail.")
+
+    # ---------------------------------------------------------- register
+    # Both sides go into the same register the sweeps write to, so a gate result
+    # is comparable with every other experiment instead of living in stdout.
+    if row_from_metrics is not None:
+        registry = Path(args.registry) if args.registry else out / "experiments.csv"
+        for tag, runs, ck in (("baseline", base_runs, base_ck),
+                              ("candidate", cand_runs, cand_ck)):
+            for seed, m in zip(seeds, runs):
+                eid = f"{tag}-{ck.stem}-s{seed}"
+                row = row_from_metrics(m, eid, eid, args.n)
+                row["size_gb"] = round(ck.stat().st_size / 1e9, 3)
+                append_row(registry, row)
+        print(f"\nregistered in {registry}")
     if identical:
         print("\nMetrics are EXACTLY equal. The candidate's weights are bit-identical\n"
               "to the baseline's, so this optimisation is provably lossless.")

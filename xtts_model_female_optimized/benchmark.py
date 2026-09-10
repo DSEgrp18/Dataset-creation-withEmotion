@@ -49,6 +49,9 @@ from pathlib import Path
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "xtts_sinhala"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "xtts_model_female"))
+
+from sweep_eval import append_row  # noqa: E402  (after the path insert)
 
 SENTENCES_SI = [
     "ආයුබෝවන්, ඔබට කොහොමද?",
@@ -71,7 +74,15 @@ def main() -> int:
     ap.add_argument("--deepspeed", action="store_true", help="DeepSpeed inference kernels")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeat", type=int, default=3)
+    # The decode config changes how many tokens get generated, so it changes RTF
+    # and latency. Benchmarking at 0.75/5.0/50/0.85 a model that will ship at
+    # something else measures a configuration nobody runs -- these mirror
+    # evaluate_xtts.py so one set of numbers describes one deployment.
     ap.add_argument("--temperature", type=float, default=0.75)
+    ap.add_argument("--repetition-penalty", type=float, default=5.0)
+    ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--top-p", type=float, default=0.85)
+    ap.add_argument("--length-penalty", type=float, default=1.0)
     args = ap.parse_args()
 
     import torch
@@ -114,7 +125,9 @@ def main() -> int:
         return model.inference(
             text=text, language="en", gpt_cond_latent=gpt_latent,
             speaker_embedding=spk_emb, temperature=args.temperature,
-            length_penalty=1.0, repetition_penalty=5.0, top_k=50, top_p=0.85,
+            length_penalty=args.length_penalty,
+            repetition_penalty=args.repetition_penalty,
+            top_k=args.top_k, top_p=args.top_p,
             enable_text_splitting=False)
 
     # Discarded: the first call pays for CUDA kernel autotuning and allocator
@@ -159,6 +172,11 @@ def main() -> int:
         "half": int(args.half),
         "deepspeed": int(args.deepspeed),
         "device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
+        "temperature": args.temperature,
+        "repetition_penalty": args.repetition_penalty,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "length_penalty": args.length_penalty,
         "load_s": round(load_s, 1),
         "peak_vram_gb": round(vram, 2),
         "rtf_mean": round(statistics.fmean(rtfs), 3),
@@ -167,13 +185,12 @@ def main() -> int:
         "audio_s": round(audio_s, 1),
     }
 
+    # Widening writer rather than a plain append: a results.csv written before
+    # the decode columns existed would otherwise take the new rows under the old
+    # header and drop them without saying so. Rows are appended, never replaced --
+    # repeat timings of one tag are how you see the spread.
     out = Path(args.out)
-    new = not out.is_file()
-    with out.open("a", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(row))
-        if new:
-            w.writeheader()
-        w.writerow(row)
+    append_row(out, row, key=None)
 
     print("\n" + "  ".join(f"{k}={v}" for k, v in row.items()))
     print(f"\nappended to {out}")

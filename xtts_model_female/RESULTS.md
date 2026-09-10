@@ -354,22 +354,69 @@ Revised after Run 4. **Training longer is no longer on this list** — eval loss
 step 15 800 and rose after, so the training configuration has stopped being the binding
 constraint. ~~Get past step 5850~~ is done.
 
+Each of these now has a command. **None of them has been run yet** — the rows below are
+the plan, and the register is where the answers go.
+
 1. **Fix the over-generation, at decode time — costs no GPU hours.** Failure rate 0 → 3.8 %
    and duration ratio 1.026 (dinithi 1.057) are the only clear regressions, and both are
    decoding behaviour, not weights. Sweep `--temperature` down from 0.75 (try 0.65, 0.6)
    and `repetition_penalty` up from 5.0 on the *existing* checkpoint, and read
    `failure_rate` and `duration_ratio` from the non-failed table. If failures go to zero
    without MCD moving, that is a free win over Run 4 and it is the cheapest thing here.
+   → `sweep_eval.py --checkpoints <run>/best_model.pth --temperature 0.75,0.65,0.6`
 2. **Evaluate an earlier checkpoint against step 15 800.** Run 3's model (~step 5 250) had
    0 % failures and a better UTMOS at a worse loss. If an intermediate checkpoint beats
    both, "best eval loss" is the wrong export criterion for this model and the export
-   should follow UTMOS/failure rate instead. Cheap: `evaluate_xtts.py --checkpoint`.
+   should follow UTMOS/failure rate instead.
+   → `sweep_eval.py --all-checkpoints --utmos`
 3. **MOS / SUS panel.** Now genuinely worth the effort — the model has converged, and no
    objective metric here can say whether `loss_mel_ce` 2.75 *sounds* acceptable in Sinhala.
    `listening_test.html` is already built. Have a native speaker vet `answer_key.json` for
    ungrammatical SUS items first, then report blind and sighted raters separately.
 4. **Transliterate dinithi's text too**, to decouple text path from data volume in the
    harini gap (F0 corr 0.287 vs 0.528, and it has persisted across all four runs).
-5. **More audio, especially harini.** With training converged at 6.81 h, this is the only
+   → inference side, free: `evaluate_xtts.py --text-from script`.
+   → training side, one run: `prepare_voicemakers.py --text-path script`.
+5. **Speaker-balanced sampling.** dinithi has 2 462 clips to harini's 1 135, so roughly
+   68 % of gradient steps teach dinithi's voice — which is one of the two candidate causes
+   of the harini gap, and the one that is separable from the text path by experiment 4.
+   → one run: `prepare_voicemakers.py --balance-speakers oversample`.
+6. **More audio, especially harini.** With training converged at 6.81 h, this is the only
    lever left that raises the ceiling rather than moving along it. The radio-drama corpus
    upstream is the obvious source once it is diarised.
+
+---
+
+## The experiment register
+
+Runs get a section above. **Experiments** — same weights or same data, one thing varied —
+get a row in `experiments.csv`, written by `sweep_eval.py` and `compare_quality.py`, with
+the decode configuration and the per-speaker columns in the row itself. Two rows are only
+comparable if their `temperature` / `repetition_penalty` / `top_k` / `top_p` / `text_from`
+columns match, which is why those are columns and not prose.
+
+The register is the input to this file, not a replacement for it: promote a result up here
+once it has survived a second seed, and say which experiment id it came from.
+
+Nothing in a register row is an improvement until it beats the run-to-run spread measured
+across runs 1–3: **~0.3 dB MCD, ~0.045 F0 correlation, ~0.005 SECS, and 2.5 points of
+failure rate.** That spread came from three runs that trained identically, so it is noise
+by construction.
+
+---
+
+## Deployment size — targets, and what has been measured
+
+The stripping pipeline is built and its offline claims are proved by `--verify`, which
+checks every kept tensor for identical dtype, shape and bytes. **The on-GPU numbers below
+are targets, not results.** No checkpoint has been through it yet.
+
+| Artifact | Target size | How it is justified | Measured |
+|---|---|---|---|
+| training checkpoint | ~5.6 GB | what the trainer exports: weights + AdamW state + dvae | — |
+| stripped fp32 | ~1.9 GB | weights only; bit-identical, so quality is not at risk | not yet |
+| fp16 storage | ~0.95 GB | weights rounded to fp16, arithmetic unchanged | **not yet — must pass the gate first** |
+
+Fill the "measured" column from `experiments/results.csv` (size, load, VRAM, RTF,
+first-audio) and the gate output (quality). Until then, "0.95 GB with no degradation" is a
+target this repo has tooling for and no evidence of.

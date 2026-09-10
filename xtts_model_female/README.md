@@ -41,6 +41,7 @@ female audio (~2 h). This corpus has ~7 h of it.
 | [`prepare_voicemakers.py`](prepare_voicemakers.py) | discover → filter → fold → `metadata_train/eval.csv`, with the `[UNK]` gate |
 | [`train_xtts_female.py`](train_xtts_female.py) | the official Coqui recipe, deviations documented in the docstring |
 | [`evaluate_xtts.py`](evaluate_xtts.py) | MCD, F0, speaker similarity, failure rate, RTF, optional UTMOS and ASR |
+| [`sweep_eval.py`](sweep_eval.py) | runs `evaluate_xtts.py` over several checkpoints or decode settings, into one register |
 | [`listening_test.py`](listening_test.py) | builds the MOS + SUS panel as one self-contained HTML file |
 | [`score_listening.py`](score_listening.py) | rater CSVs → MOS and SUS numbers, split by rater group |
 | [`kaggle_xtts_female.ipynb`](kaggle_xtts_female.ipynb) | Run All |
@@ -245,6 +246,46 @@ exactly 0.00 dB, a small perturbation gives ~13.5 dB, and the value is monotone 
 spectral distance. F0 RMSE recovers a known 200→260 Hz shift as 456.5 cents against a
 true 454.2. **MCD is implementation-dependent — compare runs of this script against each
 other, never against a published figure.**
+
+### Choosing between checkpoints and decode settings — `sweep_eval.py`
+
+Two questions `evaluate_xtts.py` answers one call at a time, and `sweep_eval.py`
+answers as a table:
+
+- **Which checkpoint actually sounds best?** Not necessarily the one the trainer
+  called best. Run 4 had the lowest held-out loss of any run and 3.8 % generation
+  failures against run 3's 0 %. `--all-checkpoints` scores every `.pth` in a run
+  directory on synthesis quality instead.
+- **What should decoding be set to?** `temperature`, `repetition_penalty`, `top_k`
+  and `top_p` are now flags on `evaluate_xtts.py` rather than constants in it,
+  because truncation, looping and over-generation are decode behaviour and cost no
+  training to fix.
+
+```bash
+python sweep_eval.py --run <run> --base <base> --dataset <ds> --all-checkpoints
+python sweep_eval.py --run <run> --base <base> --dataset <ds>     --checkpoints <run>/best_model.pth --temperature 0.75,0.65,0.6
+```
+
+Every experiment gets its own directory and one row in `experiments.csv`, including
+per-speaker columns. An experiment that already has a `metrics.json` is skipped
+rather than re-run, so a sweep survives Kaggle's 12 h limit and nothing already
+measured is overwritten. The table is **ordered**, by failure rate then duration
+ratio then MCD over non-failed clips — it does not pick a winner. See
+[`../xtts_model_female_optimized/compare_quality.py`](../xtts_model_female_optimized/compare_quality.py)
+for the part that can fail a candidate outright.
+
+### The two levers that need a retrain
+
+Both are flags on `prepare_voicemakers.py`, and both are untested — they change the
+training data, so they cost a run each:
+
+| Flag | The question |
+|---|---|
+| `--text-path script` | dinithi's text comes from `fold(romanisation)`, harini's from `sinhala_to_ascii(script)`, and those agree on only ~96.6 % of lines. This puts both speakers on one path, separating "worse text path" from "less data" in the harini gap |
+| `--balance-speakers oversample` | dinithi has 2 462 clips to harini's 1 135, so ~68 % of gradient steps teach dinithi. This repeats harini's rows until the counts match. Eval is never touched |
+
+`--text-from script` on `evaluate_xtts.py` is the inference-side half of the first
+one, and needs no retrain.
 
 ### What needs humans — `listening_test.py`
 
