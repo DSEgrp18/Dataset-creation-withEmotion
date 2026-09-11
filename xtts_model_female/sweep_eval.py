@@ -210,6 +210,10 @@ def exp_id_for(ckpt: Path, cfg: dict) -> str:
              f"k{cfg['top_k']}", f"p{cfg['top_p']:g}", f"lp{cfg['length_penalty']:g}"]
     if cfg["text_from"] != "dataset":
         parts.append(cfg["text_from"])
+    # Only non-default seeds are named, so ids already in a register stay valid
+    # and a re-run at seed 1234 still resolves to the same experiment.
+    if cfg.get("seed", 1234) != 1234:
+        parts.append(f"s{cfg['seed']}")
     return "__".join(parts)
 
 
@@ -247,6 +251,12 @@ def main() -> int:
                     help="every checkpoint in --run -- this is step 2")
     ap.add_argument("--n", type=int, default=40, help="eval clips per speaker")
     ap.add_argument("--seed", type=int, default=1234)
+    # Two results inside the noise floor cannot be separated by measuring them
+    # more precisely -- they differ because XTTS samples. Resolving one costs
+    # SEEDS, not a bigger --n: the same config at three seeds says whether a
+    # difference survives resampling. Every config is run at every seed.
+    ap.add_argument("--seeds", default=None,
+                    help="comma-separated seeds; multiplies the grid")
     ap.add_argument("--temperature", default="0.75")
     ap.add_argument("--repetition-penalty", default="5.0")
     ap.add_argument("--top-k", default="50")
@@ -295,21 +305,24 @@ def main() -> int:
             print(f"no such checkpoint: {c}", file=sys.stderr)
         return 2
 
+    seeds = parse_list(args.seeds, int) if args.seeds else [args.seed]
     grid = [
         dict(zip(("temperature", "repetition_penalty", "top_k", "top_p",
-                  "length_penalty", "text_from"), combo))
+                  "length_penalty", "text_from", "seed"), combo))
         for combo in itertools.product(
             parse_list(args.temperature, float),
             parse_list(args.repetition_penalty, float),
             parse_list(args.top_k, int),
             parse_list(args.top_p, float),
             parse_list(args.length_penalty, float),
-            parse_list(args.text_from, str))
+            parse_list(args.text_from, str),
+            seeds)
     ]
     plan = [(c, cfg) for c in ckpts for cfg in grid]
 
-    print(f"{len(ckpts)} checkpoint(s) x {len(grid)} decode config(s) "
-          f"= {len(plan)} experiment(s), {args.n} clips per speaker each")
+    print(f"{len(ckpts)} checkpoint(s) x {len(grid)} config(s) "
+          f"(seeds {seeds}) = {len(plan)} experiment(s), "
+          f"{args.n} clips per speaker each")
     for ckpt, cfg in plan:
         eid = exp_id_for(ckpt, cfg)
         done = (out / eid / "metrics.json").is_file()
@@ -337,7 +350,7 @@ def main() -> int:
             cmd = [sys.executable, str(EVAL),
                    "--run", str(run), "--base", args.base, "--dataset", args.dataset,
                    "--checkpoint", str(ckpt), "--out", str(exp_out),
-                   "--n", str(args.n), "--seed", str(args.seed), "--label", eid,
+                   "--n", str(args.n), "--seed", str(cfg["seed"]), "--label", eid,
                    "--temperature", str(cfg["temperature"]),
                    "--repetition-penalty", str(cfg["repetition_penalty"]),
                    "--top-k", str(cfg["top_k"]), "--top-p", str(cfg["top_p"]),
@@ -490,6 +503,18 @@ def _selftest() -> int:
                       {"temperature": 0.75, "repetition_penalty": 5.0, "top_k": 50,
                        "top_p": 0.85, "length_penalty": 1.0,
                        "text_from": "script"}).endswith("__script")
+
+    # Seeds: the default stays unnamed so ids already in a register keep
+    # resolving, and a non-default seed gets its own id -- without which three
+    # seeds of one config collide into one directory and two are silently
+    # skipped as "already measured".
+    base_cfg = {"temperature": 0.75, "repetition_penalty": 5.0, "top_k": 50,
+                "top_p": 0.85, "length_penalty": 1.0, "text_from": "dataset"}
+    assert exp_id_for(Path("m.pth"), base_cfg) ==         exp_id_for(Path("m.pth"), {**base_cfg, "seed": 1234})
+    assert exp_id_for(Path("m.pth"), {**base_cfg, "seed": 1235}).endswith("__s1235")
+    ids = {exp_id_for(Path("m.pth"), {**base_cfg, "seed": sd})
+           for sd in (1234, 1235, 1236)}
+    assert len(ids) == 3, ids
 
     # find_checkpoints: stepped bests preferred, best_model.pth not double-scored.
     (tmp / "run").mkdir()
