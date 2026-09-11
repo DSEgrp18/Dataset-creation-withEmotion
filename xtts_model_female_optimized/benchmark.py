@@ -109,14 +109,25 @@ def main() -> int:
                           vocab_path=str(base / "vocab.json"),
                           use_deepspeed=args.deepspeed)
     model.to(device)
-    if args.half:
-        model.half()
     load_s = time.time() - t0
 
+    # Conditioning runs in fp32, BEFORE any half() cast. XTTS's speaker encoder
+    # loads the reference wav itself and hands fp32 audio to a conv1d, so halving
+    # the whole model first makes that conv see fp32 input against fp16 weights:
+    #
+    #   RuntimeError: Input type (torch.cuda.FloatTensor) and weight type
+    #   (torch.cuda.HalfTensor) should be the same
+    #
+    # Nothing is lost by ordering it this way. The speaker encoder is used only
+    # here, never by inference(), so the path this row actually measures -- GPT
+    # plus vocoder -- still runs entirely in half precision. In production the
+    # latents are computed once per speaker and cached, so they are not on the
+    # per-request path either.
     gpt_latent, spk_emb = model.get_conditioning_latents(
         audio_path=[args.ref], gpt_cond_len=config.gpt_cond_len,
         max_ref_length=config.max_ref_len, sound_norm_refs=config.sound_norm_refs)
     if args.half:
+        model.half()
         gpt_latent, spk_emb = gpt_latent.half(), spk_emb.half()
 
     texts = [to_ascii(s) for s in SENTENCES_SI]
