@@ -186,9 +186,29 @@ def main() -> int:
         config.load_json(str(config_file))
         if restore_path is None:
             restore_path = str(model_file)
+
+        # A RELEASED config is an inference config. VITS builds its discriminator
+        # only when init_discriminator is set, and the published checkpoint turns
+        # it off because synthesis never uses it -- so training against that
+        # config dies with "'Vits' object has no attribute 'disc'" the moment the
+        # trainer asks for the discriminator's optimizer.
+        #
+        # Turning it back on means the discriminator starts from random weights
+        # while the generator is pretrained. That is the normal and correct shape
+        # of a VITS fine-tune: the adversarial half re-learns quickly against a
+        # generator that is already good, which is exactly why fine-tuning beats
+        # training both halves from scratch on this much data.
+        margs = config.model_args
+        if isinstance(margs, dict):
+            margs["init_discriminator"] = True
+        else:
+            margs.init_discriminator = True
+
         print(f"  weights : {restore_path}")
         print(f"  sample rate {config.audio.sample_rate}, "
               f"phonemes={config.use_phonemes} ({config.phoneme_language})")
+        print("  discriminator: re-enabled (absent from the released config) and "
+              "starting from random weights")
 
     dataset_config = BaseDatasetConfig(
         formatter="coqui",
