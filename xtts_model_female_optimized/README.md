@@ -67,11 +67,23 @@ that remain are bit-for-bit the ones the model already used, so there is nothing
 verify beyond that the file loads. coqui's own loader discards the same three modules
 on the way in; `--strip` just stops shipping them.
 
-| | Size | Quality |
-|---|---|---|
-| as exported | 5.60 GB | — |
-| `--strip` | ~1.90 GB | **identical**, provably |
-| `--strip --fp16` | ~0.95 GB | small change — must be measured |
+| | Size | Quality | |
+|---|---|---|---|
+| as exported | **5.608 GB** | — | Run 5 |
+| `--strip` | **1.868 GB** | **exactly equal** — 963 tensors bit-identical | Run 5 |
+| `--strip --fp16` | **0.934 GB** | not worse on any metric at three seeds | Session B |
+
+Those are measurements now, not targets. The strip was verified twice by different means:
+`--verify` checked all 963 kept tensors for identical dtype, shape and bytes, and
+`compare_quality.py` independently returned `+0.0000` on MCD, F0 RMSE, F0 corr, SECS and
+UTMOS. fp16 was compared against the fp32 slim model at seeds 1234/1235/1236 — mean MCD
+62.776 vs 63.066, F0 corr 0.438 vs 0.436, UTMOS 2.681 vs 2.677, against a measured
+sampling-noise floor of ±0.25 dB MCD and ±0.014 F0 corr.
+
+**Peak VRAM is 2.47 GB for all three files.** `load_state_dict` casts each tensor to the
+dtype of the parameter receiving it, so an fp16 *file* becomes an fp32 *model* in memory.
+Shrinking the file buys download size and ~3.4 s of load time (16.7 s → 13.3 s); it does
+not buy memory and it does not lower the GPU tier the model needs.
 
 **`--fp16` halves the file, not the arithmetic.** `load_state_dict` casts each tensor
 to the dtype of the parameter receiving it, so an fp16 file loaded into XTTS runs in

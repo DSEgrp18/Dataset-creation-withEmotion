@@ -507,6 +507,144 @@ slim-fp32 wearing another name. fp16 compute is the only lever here that could m
 - **Best-eval-loss as export criterion is still open**, and this run's checkpoints can no
   longer answer it.
 
+---
+
+## Session B — 2026-09-11 — no training, four questions, and a measured noise floor
+
+Kernel `uom230429e/xtts-session-b`, run against Run 5's output attached read-only. No
+training: the model is fixed and every row below differs only in seed, decode config or
+text path. Thirteen rows in `experiments/experiments.csv` — Run 5's six carried forward,
+seven new.
+
+The point of the session was that **Run 5 compared fp16 against fp32 at one seed**, and a
+one-seed comparison of a sampling decoder is not a result.
+
+### The noise floor, finally measured on its own
+
+Three seeds of `model_slim.pth` — **identical weights**, so the only thing varying is
+XTTS's sampling:
+
+| Seed | MCD (ok) | F0 corr | SECS | Dur. | Fail % | UTMOS |
+|---|---|---|---|---|---|---|
+| 1234 | 63.121 | 0.443 | 0.711 | 1.007 | 2.5 | 2.697 |
+| 1235 | 62.913 | 0.435 | 0.707 | 1.018 | 1.2 | 2.668 |
+| 1236 | 63.163 | 0.429 | 0.717 | 1.021 | 2.5 | 2.667 |
+| **spread** | **0.25** | **0.014** | **0.010** | **0.014** | **1.3 pt** | **0.030** |
+
+This supersedes the runs 1–3 estimate as the number to judge a change against. The old one
+was measured across three *training* runs, so it mixed sampling noise with whatever differed
+between runs; this one isolates sampling. The two agree closely (0.25 vs ~0.30 dB MCD),
+which is itself reassuring.
+
+**Any claim in this file smaller than the row above is not evidence of anything.**
+
+### Q2 — fp16 versus fp32, three seeds each
+
+| | seed 1234 | 1235 | 1236 | mean |
+|---|---|---|---|---|
+| MCD (ok) fp32 | 63.121 | 62.913 | 63.163 | **63.066** |
+| MCD (ok) fp16 | 62.792 | 62.633 | 62.902 | **62.776** |
+| F0 corr fp32 | 0.443 | 0.435 | 0.429 | **0.436** |
+| F0 corr fp16 | 0.443 | 0.436 | 0.436 | **0.438** |
+| Dur. ratio fp32 | 1.0066 | 1.0176 | 1.0209 | **1.0150** |
+| Dur. ratio fp16 | 1.0052 | 1.0057 | 1.0114 | **1.0074** |
+| Fail % fp32 | 2.5 | 1.2 | 2.5 | **2.1** |
+| Fail % fp16 | 0.0 | 0.0 | 2.5 | **0.8** |
+| UTMOS fp32 | 2.697 | 2.668 | 2.667 | **2.677** |
+| UTMOS fp16 | 2.717 | 2.660 | 2.667 | **2.681** |
+
+**fp16 is not worse on any metric.** F0 corr, SECS and UTMOS are flat to three decimal
+places of the noise floor. That validates the deployment candidate at 0.934 GB — which was
+the question this session existed to answer.
+
+**An oddity worth recording rather than burying.** fp16 has the lower MCD at *every* seed,
+by a consistent 0.26–0.33 dB, and the two sets of three barely fail to overlap (fp32 min
+62.913, fp16 max 62.902). Duration ratio is likewise closer to 1.0 at every seed. Those are
+probably one effect and not two — less over-generation means fewer bad frames means lower
+MCD — but there is **no mechanism by which rounding weights to fp16 improves spectral
+accuracy**, and a clean 3-versus-3 separation happens by chance about one time in twenty.
+Recorded as unexplained. It does not change the decision, and it should not be quoted as
+"fp16 is better".
+
+### Q3 — decode temperature: measured, and rejected
+
+One seed each, on the fp16 candidate:
+
+| temp | Fail % | Dur. | MCD (ok) | F0 corr | dinithi F0 | harini F0 |
+|---|---|---|---|---|---|---|
+| **0.75** | **0.0** | 1.005 | **62.79** | **0.443** | 0.556 | **0.330** |
+| 0.70 | 1.2 | 1.005 | 62.96 | 0.412 | 0.536 | 0.291 |
+| 0.65 | 1.2 | 1.008 | 62.97 | 0.430 | 0.572 | 0.291 |
+
+Lowering the temperature **added a failure rather than removing one**, and harini's F0
+correlation fell to 0.291 at both lower settings — consistent in direction and larger than
+the 0.014 noise floor. The over-generation that made this the top-priority experiment after
+Run 4 (3.8 % failures, duration ratio 1.026) is simply not present any more.
+
+**Keep temperature 0.75, repetition_penalty 5.0, top_k 50, top_p 0.85.** This is the first
+entry in this file recording a tuning experiment that found nothing, which is the outcome
+most worth writing down — without it the next person sweeps temperature again.
+
+### Q4 — one text path for both speakers, at inference
+
+`--text-from script` re-derives every clip's text through `sinhala_to_ascii`. Only **4 of 80
+clips changed at all**.
+
+| | dinithi fail / MCD(ok) / F0 | harini fail / MCD(ok) / F0 |
+|---|---|---|
+| as prepared | 0.0 / 60.74 / 0.556 | 0.0 / 64.84 / **0.330** |
+| unified `script` | 2.5 / 60.83 / 0.579 | 0.0 / 64.84 / **0.330** |
+
+**harini is identical to three decimal places, and that is the control working.** Her text
+already came through `sinhala_to_ascii`, so the flag must change nothing for her, and it
+does not. dinithi — fed transliterated text she was *not* trained on — does not degrade.
+
+So the two paths are interchangeable **at inference**: a server can run one
+`sinhala_to_ascii` path for every speaker and never track which text path a voice was
+trained on. That is a real simplification for `voice-service`.
+
+It says **nothing** about the training-side question. harini's numbers could not move here,
+so whether training both speakers on one path closes her gap is still open and still needs
+a retrain.
+
+### Not measured: fp16 compute
+
+Failed again, and the row does not exist. `benchmark.py --half` calls `model.half()`, and
+XTTS builds fp32 tensors inside `generate()`, so the cast collides somewhere no matter where
+it is placed — first in the speaker encoder's `conv1d`, then after that was fixed, at `ln_1`
+inside the GPT2 block with `expected scalar type Float but found Half`.
+
+The approach is wrong, not the placement: **`torch.autocast` is what fp16 inference needs** —
+weights stay fp32 and the matmuls run in half precision. Blanket `.half()` on XTTS does not
+work. This remains the only untested lever on RTF.
+
+### The engineering log — four attempts to run one session
+
+Worth recording because three of the four failures were infrastructure, not science, and
+the same traps are waiting for the next session.
+
+| Version | Started by | GPU | Died | Cost |
+|---|---|---|---|---|
+| 1 | `kernels push` | P100 | first CUDA call, 25 min in | 25 min |
+| 2 | UI re-run | T4 | `model.half()` dtype collision | ~8 min |
+| 3 | `kernels push` | P100 | **preflight, 3 min** | 3 min |
+| 4 | UI re-run | T4 | completed | ~70 min |
+
+Three lessons, all now enforced in code rather than remembered:
+
+1. **`kaggle kernels push` resets the accelerator.** The Kaggle API has no accelerator-type
+   field — only `enable_gpu` — so every CLI push drops a T4 setting back to Kaggle's default,
+   which was a P100. A P100 is **sm_60 and the installed PyTorch builds no kernels for it**,
+   so every CUDA call fails with `no kernel image is available for execution on the device`.
+   Pushing code and choosing the card are permanently two steps, and the second is manual.
+2. **Check the GPU in the first seconds, by running a kernel on it.** `get_arch_list()` alone
+   is not enough: a P100 reports its capability perfectly happily and only fails on the first
+   real operation. The preflight cell turned a 25-minute failure into a 3-minute one.
+3. **An optional step must not be able to abort the session.** The fp16-compute benchmark is
+   one row of a results table, and twice it took three hours of queued experiments down with
+   it before a single one had run. It is wrapped in `try/except` now. Order work by value and
+   let the cheap, speculative parts fail alone.
+
 ## Next experiments, in order of expected value
 
 Revised after Run 5. **Training longer is off this list for good** — Runs 4 and 5 bottomed
@@ -516,38 +654,40 @@ at 2.7480 and 2.7502 independently, so the plateau is replicated, not a fluke of
 
 Each has a command, and the register is where the answers go.
 
-1. **Settle fp16 against fp32 with more seeds — the cheapest open question.** Run 5's
-   comparison was one seed, and fp16 came out nominally ahead on four of six metrics with
-   every delta inside the noise floor. Two more seeds say whether anything survives
-   resampling. Until then the shipping claim is "not distinguishable", not "equal".
-   → `sweep_eval.py --checkpoints model_slim.pth model_fp16.pth --seeds 1235,1236`
-2. **Measure fp16 compute.** Never measured — Run 5's notebook built the `--half` argument
-   and did not pass it, so that row duplicated slim-fp32. It is the only lever that can
-   move RTF, and it changes arithmetic, so it needs its own gate before shipping.
-   → `benchmark.py --checkpoint model_slim.pth --tag fp16-compute --half`
-3. **Decode tuning — now lower value than Run 4 implied.** Run 5's deployment candidate
-   already reports 0.0 % failures and duration ratio 1.005 at t=0.75, so the
-   over-generation this was meant to fix has largely gone. Two temperatures, not ten.
-   → `sweep_eval.py --checkpoints model_fp16.pth --temperature 0.65,0.7`
-4. **Preserve checkpoints so the export criterion can be tested at all.** Run 5 could not
+~~1. Settle fp16 against fp32 with more seeds~~ — **done in Session B.** Three seeds each;
+   fp16 is not worse on any metric. The 0.934 GB candidate is validated.
+
+~~2. Decode tuning~~ — **done in Session B, and it found nothing.** Temperature 0.65 and
+   0.70 both added a failure and cost harini 0.04 of F0 correlation. Keep 0.75 / 5.0 / 50 /
+   0.85. Do not sweep this again without a reason that did not exist in Session B.
+
+1. **A listening panel — now the binding constraint.** Every objective metric is either
+   converged or measured to be noise, and none of them can say whether `loss_mel_ce` 2.75
+   *sounds* acceptable in Sinhala. `listening_test.py` builds the kit and
+   `listen/kaggle_xtts_listen.ipynb` is the interactive version. Have a native speaker vet
+   `answer_key.json` for ungrammatical SUS items first, then report blind and sighted
+   raters separately.
+2. **Measure fp16 compute with `torch.autocast`.** Still the only untested lever on RTF.
+   `model.half()` does not work on XTTS — it collides with fp32 tensors built inside
+   `generate()` — so the implementation has to change, not just the call site.
+3. **Preserve checkpoints so the export criterion can be tested at all.** Run 5 could not
    settle whether best-eval-loss is the right export: `save_n_checkpoints=1` deleted four
    earlier bests and `checkpoint_22000.pth` died with the session, leaving two candidates
    that differ by less than noise. Mirror **stripped** 1.9 GB checkpoints — several fit the
    20 GB quota where two 5.5 GB ones do not.
    → `optimize_checkpoint.py --strip` inside the training cell, before mirroring.
-5. **MOS / SUS panel.** Now genuinely worth the effort — the model has converged, and no
-   objective metric here can say whether `loss_mel_ce` 2.75 *sounds* acceptable in Sinhala.
-   `listening_test.html` is already built. Have a native speaker vet `answer_key.json` for
-   ungrammatical SUS items first, then report blind and sighted raters separately.
-6. **Transliterate dinithi's text too**, to decouple text path from data volume in the
+4. **The formal MOS / SUS panel**, as opposed to informal listening — the same kit, but
+   scored. `score_listening.py` reads the returned forms. Worth doing once informal
+   listening says the voice is broadly acceptable; not worth recruiting raters before that.
+5. **Transliterate dinithi's text too**, to decouple text path from data volume in the
    harini gap (F0 corr 0.331 vs 0.564 in Run 5, and it has persisted across all five).
    → inference side, free: `evaluate_xtts.py --text-from script`.
    → training side, one run: `prepare_voicemakers.py --text-path script`.
-7. **Speaker-balanced sampling.** dinithi has 2 462 clips to harini's 1 135, so roughly
+6. **Speaker-balanced sampling.** dinithi has 2 462 clips to harini's 1 135, so roughly
    68 % of gradient steps teach dinithi's voice — which is one of the two candidate causes
    of the harini gap, and the one that is separable from the text path by experiment 4.
    → one run: `prepare_voicemakers.py --balance-speakers oversample`.
-8. **More audio, especially harini.** With training converged at 6.81 h, this is the only
+7. **More audio, especially harini.** With training converged at 6.81 h, this is the only
    lever left that raises the ceiling rather than moving along it. The radio-drama corpus
    upstream is the obvious source once it is diarised.
 
@@ -581,7 +721,7 @@ Every number below is measured, not targeted. Method: `optimize_checkpoint.py --
 |---|---|---|---|
 | training checkpoint | ~5.6 GB | **5.608 GB** | — |
 | stripped fp32 | ~1.9 GB | **1.868 GB** | **exactly equal** — 963 tensors bit-identical |
-| fp16 storage | ~0.95 GB | **0.934 GB** | no metric outside the noise floor |
+| fp16 storage | ~0.95 GB | **0.934 GB** | **validated at three seeds** (Session B) |
 
 The one result that changes a deployment decision: **peak VRAM is 2.47 GB for all three**,
 because an fp16 file loads into an fp32 model. Shrinking the file does not shrink the card
