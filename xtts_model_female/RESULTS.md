@@ -18,6 +18,7 @@ changed `evaluate_xtts.py`, that is a new row.
 | 2 | 2026-08-22 | `GPT_XTTS_si_female-August-22-2026_11+42AM-3c817d0` | 5 850 | 63.34 | 0.384 | 0.701 | 1.2 | 2.73 / 3.27 |
 | 3 | 2026-08-22 | `GPT_XTTS_si_female-August-22-2026_04+41PM-03c7fa2` | 5 850 | 63.04 | 0.429 | 0.705 | **0.0** | — |
 | 4 | 2026-08-23 | first run past the OOM ceiling — best at step **15 800** | ~22 000 | 63.67 | 0.407 | 0.704 | 3.8 | 2.68 / 3.27 |
+| 5 | 2026-09-10 | `GPT_XTTS_si_female-September-10-2026_04+52PM-9b1b514` — best at step **14 080** | ~22 950 | 62.99 | 0.448 | 0.710 | 2.5 | 2.70 / 3.27 |
 
 ---
 
@@ -348,40 +349,205 @@ constraint. The next gains have to come from data or from decoding, not from mor
 
 ---
 
+---
+
+## Run 5 — 2026-09-10 — a replication, and the deployment pipeline proved end to end
+
+`GPT_XTTS_si_female-September-10-2026_04+52PM-9b1b514`
+
+Same data and configuration as Run 4. The model is not the interesting part — it landed
+in the same place — but this was the first run to carry the checkpoint sweep, the
+strip/fp16 export and the benchmark through to numbers.
+
+### Training
+
+| | |
+|---|---|
+| reached | global step **22 950**, epoch **26 of 40** |
+| wall clock | **8.48 h** at **1.33 s/step**, ended by the 8.5 h budget (exit −15) |
+| train `loss_mel_ce` | 4.6359 → 2.5604 over 460 logged points |
+| eval `loss_mel_ce` | best **2.7502 at step 14 050**, last 2.7750, over 26 evals |
+| curve verdict | **`plateau`** — flat within noise for 10 evals |
+| written as best | 8 800, 9 680, 10 560, 11 440, 13 200, **14 080** |
+
+Run 4 bottomed at **2.7480 @ step 15 800**; this run at **2.7502 @ step 14 050**. That is
+a **replication, not a difference** — 0.0022 of held-out loss, on the flat part of the
+curve. Two independent runs now agree: **6.81 h of audio takes XTTS-v2 to `loss_mel_ce`
+≈ 2.75 and no further.** Every guard behaved — no NaN, no OOM, no disk stop; the budget
+ended it.
+
+### Results — `best_model.pth`, which is the step-14 080 copy
+
+| Scope | MCD dB | log-F0 RMSE | F0 corr | SECS | Dur. ratio | Fail % | RTF |
+|---|---|---|---|---|---|---|---|
+| best_model | 62.99 | 346.9 | 0.448 | 0.710 | 1.007 | 2.5 | 0.521 |
+| dinithi | 61.04 | 315.3 | 0.564 | 0.686 | 1.037 | 2.5 | 0.520 |
+| harini | 64.93 | 378.4 | 0.331 | 0.735 | 0.977 | 2.5 | 0.522 |
+
+Over the 78 of 80 clips that did not fail generation:
+
+| Scope | Clips | MCD dB | log-F0 RMSE | F0 corr | SECS |
+|---|---|---|---|---|---|
+| best_model | 78/80 | 63.12 | 349.0 | 0.443 | 0.711 |
+| dinithi | 39/40 | 61.13 | 318.4 | 0.558 | 0.687 |
+| harini | 39/40 | 65.11 | 379.6 | 0.329 | 0.735 |
+
+UTMOS 2.70 synth / 3.27 real (dinithi 2.71/3.37, harini 2.68/3.17).
+
+**The harini gap is now five for five.** F0 corr 0.331 against dinithi's 0.564, and it has
+appeared in every run this file records. Less audio and a different text path remain
+confounded.
+
+### Run 4 vs Run 5
+
+| Metric | Run 4 | Run 5 | beyond noise? |
+|---|---|---|---|
+| eval loss | 2.7480 | 2.7502 | no — a replication |
+| MCD dB | 63.67 | 62.99 | **see below** |
+| F0 corr | 0.407 | 0.448 | no (spread 0.045) |
+| SECS | 0.704 | 0.710 | marginal (spread 0.005) |
+| duration ratio | 1.026 | 1.007 | marginal |
+| failure rate | 3.8 % | 2.5 % | no (spread 2.5 pt) |
+| UTMOS | 2.68 | 2.70 | marginal (spread 0.01) |
+
+**Do not read the 0.68 dB MCD gain as progress.** Run 4 pooled three failed clips into its
+mean and Run 5 pools two, and a failed clip scores in the 108–154 "unrelated speech" band
+— enough to move a mean by more than 0.68 dB on its own. Run 4 predates the non-failed
+table, so there is no like-for-like `_ok` comparison to be had. The honest reading is that
+**Run 5 is consistent with Run 4 on every axis.**
+
+### The checkpoint sweep — step 2, and it did not settle
+
+Both surviving checkpoints, same decode config, same seed:
+
+| Checkpoint | eval loss | Fail % | Dur. | MCD (ok) | F0 corr | SECS | UTMOS |
+|---|---|---|---|---|---|---|---|
+| `checkpoint_22000` | 2.7750 | **0.0** | 1.015 | **62.69** | 0.436 | 0.715 | 2.68 |
+| `best_model_14080` | **2.7502** | 2.5 | **1.007** | 63.12 | **0.443** | 0.711 | **2.70** |
+
+Per speaker, fail % / MCD (ok) / F0 corr:
+
+| Checkpoint | dinithi | harini |
+|---|---|---|
+| `checkpoint_22000` | 0.0 / 60.56 / 0.586 | 0.0 / 64.81 / 0.286 |
+| `best_model_14080` | 2.5 / 61.13 / 0.558 | 2.5 / 65.11 / 0.329 |
+
+The checkpoint with the **worse** eval loss has zero failures and 0.43 dB better MCD,
+which is the shape the Run 4 notes predicted: best-eval-loss may be the wrong export
+criterion for an autoregressive model. But 0.43 dB sits barely outside a 0.30 dB noise
+floor, the failure difference is **two clips in eighty**, and everything else is inside
+noise. **One seed cannot settle this, and it is now unsettleable:** `save_n_checkpoints=1`
+deleted the four earlier bests, and `checkpoint_22000.pth` lived on `/kaggle/temp` and died
+with the session. Only `best_model.pth` was mirrored.
+
+The fix for next time is to mirror **stripped** 1.9 GB checkpoints instead of 5.5 GB ones —
+several fit in the 20 GB quota, where two do not.
+
+### Deployment — 5.608 GB → 1.868 GB → 0.934 GB
+
+`optimize_checkpoint.py --strip` on the real export dropped exactly what it claims:
+
+```
+optimizer state    : dropped -- optimizer
+scheduler state    : dropped -- scheduler
+gradient scaler    : dropped -- scaler
+training metadata  : dropped -- step, epoch, model_loss, date, config
+bit-identical      : 963
+```
+
+**963 inference tensors, every one bit-for-bit identical to the original.** `--verify`
+proves that structurally; `compare_quality.py` then proved it independently by measurement
+— `+0.0000` on MCD, F0 RMSE, F0 corr, SECS and UTMOS, reported as *Metrics are EXACTLY
+equal*, at **67 % smaller**. The strip is free, and that is now demonstrated twice by
+different means rather than argued from the format.
+
+The fp16 gate passed with every metric inside tolerance:
+
+| Metric | slim fp32 | fp16 | change |
+|---|---|---|---|
+| MCD dB | 62.9863 | 62.7917 | −0.1946 |
+| log-F0 RMSE | 346.8558 | 347.5275 | +0.6717 |
+| F0 corr | 0.4476 | 0.4428 | −0.0048 |
+| SECS | 0.7104 | 0.7101 | −0.0003 |
+| UTMOS | 2.6967 | 2.7172 | +0.0205 |
+| failure rate | 2.5 % | 0.0 % | −2.5 pt |
+
+**fp16 is not better.** It is nominally ahead on four of six, and every one of those deltas
+is inside the runs 1–3 noise floor — the failure difference is two clips. The defensible
+claim is that **at n=80 and one seed, fp16 storage is not distinguishable from fp32, at
+half the size.**
+
+### What it costs to run — Tesla T4
+
+| Configuration | Size GB | Load s | Peak VRAM GB | RTF mean | First audio s |
+|---|---|---|---|---|---|
+| exported | 5.608 | 16.7 | **2.47** | 0.501 | 0.51 |
+| slim fp32 | 1.868 | 14.0 | **2.47** | 0.494 | 0.48 |
+| fp16 storage | 0.934 | **13.3** | **2.47** | 0.507 | 0.48 |
+
+**Peak VRAM is identical across a 6× spread in file size.** `load_state_dict` casts each
+tensor to the dtype of the parameter receiving it, so an fp16 *file* becomes an fp32
+*model* in VRAM. fp16 storage buys disk and ~3.4 s of load time; it does not buy memory,
+and it does not lower the GPU tier the model needs. At **2.47 GB it fits any 4 GB card.**
+
+RTF came back 0.494–0.507 across identical weights, so **RTF differences under ~10 % in
+this table mean nothing.** First audio at ~0.48 s is the number a listener notices, and it
+is not RTF.
+
+A fourth row, `fp16-compute`, is **missing and was never measured**: the notebook built its
+`--half` argument and failed to pass it, so the row it produced was a duplicate of
+slim-fp32 wearing another name. fp16 compute is the only lever here that could move RTF.
+
+### What Run 5 settled
+
+- **The deployment pipeline works and its central claim is proved.** 5.608 → 1.868 GB is
+  lossless by construction *and* by measurement; 0.934 GB costs nothing detectable at this
+  sample size. All three size targets met.
+- **Training is finished as a lever**, confirmed by replication rather than asserted.
+- **Best-eval-loss as export criterion is still open**, and this run's checkpoints can no
+  longer answer it.
+
 ## Next experiments, in order of expected value
 
-Revised after Run 4. **Training longer is no longer on this list** — eval loss bottomed at
-step 15 800 and rose after, so the training configuration has stopped being the binding
-constraint. ~~Get past step 5850~~ is done.
+Revised after Run 5. **Training longer is off this list for good** — Runs 4 and 5 bottomed
+at 2.7480 and 2.7502 independently, so the plateau is replicated, not a fluke of one run.
+~~Get past step 5850~~ done. ~~Prove the deployment pipeline~~ done in Run 5: 5.608 →
+1.868 GB lossless → 0.934 GB with nothing measurable lost.
 
-Each of these now has a command. **None of them has been run yet** — the rows below are
-the plan, and the register is where the answers go.
+Each has a command, and the register is where the answers go.
 
-1. **Fix the over-generation, at decode time — costs no GPU hours.** Failure rate 0 → 3.8 %
-   and duration ratio 1.026 (dinithi 1.057) are the only clear regressions, and both are
-   decoding behaviour, not weights. Sweep `--temperature` down from 0.75 (try 0.65, 0.6)
-   and `repetition_penalty` up from 5.0 on the *existing* checkpoint, and read
-   `failure_rate` and `duration_ratio` from the non-failed table. If failures go to zero
-   without MCD moving, that is a free win over Run 4 and it is the cheapest thing here.
-   → `sweep_eval.py --checkpoints <run>/best_model.pth --temperature 0.75,0.65,0.6`
-2. **Evaluate an earlier checkpoint against step 15 800.** Run 3's model (~step 5 250) had
-   0 % failures and a better UTMOS at a worse loss. If an intermediate checkpoint beats
-   both, "best eval loss" is the wrong export criterion for this model and the export
-   should follow UTMOS/failure rate instead.
-   → `sweep_eval.py --all-checkpoints --utmos`
-3. **MOS / SUS panel.** Now genuinely worth the effort — the model has converged, and no
+1. **Settle fp16 against fp32 with more seeds — the cheapest open question.** Run 5's
+   comparison was one seed, and fp16 came out nominally ahead on four of six metrics with
+   every delta inside the noise floor. Two more seeds say whether anything survives
+   resampling. Until then the shipping claim is "not distinguishable", not "equal".
+   → `sweep_eval.py --checkpoints model_slim.pth model_fp16.pth --seeds 1235,1236`
+2. **Measure fp16 compute.** Never measured — Run 5's notebook built the `--half` argument
+   and did not pass it, so that row duplicated slim-fp32. It is the only lever that can
+   move RTF, and it changes arithmetic, so it needs its own gate before shipping.
+   → `benchmark.py --checkpoint model_slim.pth --tag fp16-compute --half`
+3. **Decode tuning — now lower value than Run 4 implied.** Run 5's deployment candidate
+   already reports 0.0 % failures and duration ratio 1.005 at t=0.75, so the
+   over-generation this was meant to fix has largely gone. Two temperatures, not ten.
+   → `sweep_eval.py --checkpoints model_fp16.pth --temperature 0.65,0.7`
+4. **Preserve checkpoints so the export criterion can be tested at all.** Run 5 could not
+   settle whether best-eval-loss is the right export: `save_n_checkpoints=1` deleted four
+   earlier bests and `checkpoint_22000.pth` died with the session, leaving two candidates
+   that differ by less than noise. Mirror **stripped** 1.9 GB checkpoints — several fit the
+   20 GB quota where two 5.5 GB ones do not.
+   → `optimize_checkpoint.py --strip` inside the training cell, before mirroring.
+5. **MOS / SUS panel.** Now genuinely worth the effort — the model has converged, and no
    objective metric here can say whether `loss_mel_ce` 2.75 *sounds* acceptable in Sinhala.
    `listening_test.html` is already built. Have a native speaker vet `answer_key.json` for
    ungrammatical SUS items first, then report blind and sighted raters separately.
-4. **Transliterate dinithi's text too**, to decouple text path from data volume in the
-   harini gap (F0 corr 0.287 vs 0.528, and it has persisted across all four runs).
+6. **Transliterate dinithi's text too**, to decouple text path from data volume in the
+   harini gap (F0 corr 0.331 vs 0.564 in Run 5, and it has persisted across all five).
    → inference side, free: `evaluate_xtts.py --text-from script`.
    → training side, one run: `prepare_voicemakers.py --text-path script`.
-5. **Speaker-balanced sampling.** dinithi has 2 462 clips to harini's 1 135, so roughly
+7. **Speaker-balanced sampling.** dinithi has 2 462 clips to harini's 1 135, so roughly
    68 % of gradient steps teach dinithi's voice — which is one of the two candidate causes
    of the harini gap, and the one that is separable from the text path by experiment 4.
    → one run: `prepare_voicemakers.py --balance-speakers oversample`.
-6. **More audio, especially harini.** With training converged at 6.81 h, this is the only
+8. **More audio, especially harini.** With training converged at 6.81 h, this is the only
    lever left that raises the ceiling rather than moving along it. The radio-drama corpus
    upstream is the obvious source once it is diarised.
 
@@ -405,18 +571,23 @@ by construction.
 
 ---
 
-## Deployment size — targets, and what has been measured
+## Deployment size — measured, Run 5
 
-The stripping pipeline is built and its offline claims are proved by `--verify`, which
-checks every kept tensor for identical dtype, shape and bytes. **The on-GPU numbers below
-are targets, not results.** No checkpoint has been through it yet.
+Every number below is measured, not targeted. Method: `optimize_checkpoint.py --strip`
+(and `--fp16`), verified with `--verify`, gated with `compare_quality.py`, timed with
+`benchmark.py`. Full detail in the Run 5 entry above.
 
-| Artifact | Target size | How it is justified | Measured |
+| Artifact | Target | **Measured** | Quality |
 |---|---|---|---|
-| training checkpoint | ~5.6 GB | what the trainer exports: weights + AdamW state + dvae | — |
-| stripped fp32 | ~1.9 GB | weights only; bit-identical, so quality is not at risk | not yet |
-| fp16 storage | ~0.95 GB | weights rounded to fp16, arithmetic unchanged | **not yet — must pass the gate first** |
+| training checkpoint | ~5.6 GB | **5.608 GB** | — |
+| stripped fp32 | ~1.9 GB | **1.868 GB** | **exactly equal** — 963 tensors bit-identical |
+| fp16 storage | ~0.95 GB | **0.934 GB** | no metric outside the noise floor |
 
-Fill the "measured" column from `experiments/results.csv` (size, load, VRAM, RTF,
-first-audio) and the gate output (quality). Until then, "0.95 GB with no degradation" is a
-target this repo has tooling for and no evidence of.
+The one result that changes a deployment decision: **peak VRAM is 2.47 GB for all three**,
+because an fp16 file loads into an fp32 model. Shrinking the file does not shrink the card
+you need — it buys download size and ~3.4 s of load time, which matters for a
+scale-to-zero host paying for cold starts and not much otherwise.
+
+Not measured: **fp16 compute** (`--half`), the only lever here that could move RTF. It
+would need its own quality gate before shipping, because it changes arithmetic rather than
+storage.
