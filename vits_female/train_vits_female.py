@@ -140,6 +140,7 @@ def main() -> int:
     from TTS.tts.datasets import load_tts_samples
     from TTS.tts.models.vits import Vits
     from TTS.tts.utils.speakers import SpeakerManager
+    from TTS.tts.utils.text.tokenizer import TTSTokenizer
     from TTS.utils.audio import AudioProcessor
     from TTS.utils.manage import ModelManager
 
@@ -272,8 +273,17 @@ def main() -> int:
     print(f"  batch {config.batch_size}, lr {args.lr}, fp16 {config.mixed_precision}")
     print(f"  restore  : {restore_path or 'nothing (from scratch)'}\n")
 
+    # Vits(...) takes the tokenizer as its THIRD positional argument and defaults
+    # it to None, so omitting it builds a model that looks fine and then dies in
+    # the dataloader with "'NoneType' object has no attribute 'use_phonemes'".
+    # init_from_config also returns the config, because building the tokenizer
+    # can settle fields that were unset -- so take it back rather than dropping it.
     ap_audio = AudioProcessor.init_from_config(config)
-    model = Vits(config, ap_audio, speaker_manager=speaker_manager)
+    tokenizer, config = TTSTokenizer.init_from_config(config)
+    print(f"  tokenizer: phonemes={tokenizer.use_phonemes}"
+          + (f" via {config.phonemizer or 'default'} ({config.phoneme_language})"
+             if tokenizer.use_phonemes else " (characters)"))
+    model = Vits(config, ap_audio, tokenizer, speaker_manager=speaker_manager)
 
     trainer = Trainer(
         TrainerArgs(
