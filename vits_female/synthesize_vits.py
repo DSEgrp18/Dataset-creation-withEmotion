@@ -73,9 +73,11 @@ def main() -> int:
 
     import torch
     import torchaudio
-    from TTS.tts.configs.vits_config import VitsConfig
-    from TTS.tts.models.vits import Vits
-    from TTS.utils.audio import AudioProcessor
+    # Synthesizer, not Vits. The raw model class has no .tts() -- its inference()
+    # takes token ids, so text-to-waveform (phonemize, tokenize, run, vocode)
+    # lives in this wrapper. Using it also means this script synthesises through
+    # exactly the path a deployed coqui model would.
+    from TTS.utils.synthesizer import Synthesizer
 
     run, out = Path(args.run).resolve(), Path(args.out).resolve()
     dataset = Path(args.dataset).resolve()
@@ -117,15 +119,21 @@ def main() -> int:
     print(f"items      : {len(chosen)}"
           + (f"  (speaker {args.speaker})" if args.speaker else f"  across {sorted(by_spk)}"))
 
-    config = VitsConfig()
-    config.load_json(str(cfg_path))
-    ap_audio = AudioProcessor.init_from_config(config)
-    model = Vits.init_from_config(config)
-    model.load_checkpoint(config, str(ckpt), eval=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
-    sr = config.audio.sample_rate
-    print(f"sample rate: {sr}")
+    # A multi-speaker run writes speakers.pth beside the checkpoint; a per-voice
+    # run does not, and passing a path that does not exist makes the Synthesizer
+    # look for a speaker it will never be given.
+    speakers_file = run / "speakers.pth"
+    cuda = torch.cuda.is_available()
+    syn = Synthesizer(
+        tts_checkpoint=str(ckpt),
+        tts_config_path=str(cfg_path),
+        tts_speakers_file=str(speakers_file) if speakers_file.is_file() else "",
+        use_cuda=cuda,
+    )
+    sr = syn.output_sample_rate
+    multi = speakers_file.is_file()
+    print(f"sample rate: {sr}   device: {'cuda' if cuda else 'cpu'}"
+          + ("   (multi-speaker)" if multi else ""))
 
     total_audio = total_time = 0.0
     for i, it in enumerate(chosen, 1):
@@ -134,7 +142,7 @@ def main() -> int:
         # text that is already ASCII and a safety net if it is not.
         text = to_ascii(it["ascii"])
         t0 = time.time()
-        wav = model.tts(text)
+        wav = syn.tts(text, speaker_name=(it["speaker"] if multi else None))
         elapsed = time.time() - t0
 
         tensor = torch.as_tensor(wav, dtype=torch.float32).reshape(1, -1)
